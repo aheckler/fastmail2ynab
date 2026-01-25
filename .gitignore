@@ -1,0 +1,12 @@
+# Environment variables (contains API keys)
+.env
+
+# Local database (contains user data)
+processed_emails.db
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Claude Code files
+.claude/
