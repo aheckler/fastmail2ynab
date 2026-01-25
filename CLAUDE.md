@@ -31,10 +31,9 @@ Dependencies are declared inline using PEP 723 script metadata, so uv handles th
 | `--dry-run` | Preview what transactions would be created without actually creating them or marking emails as processed. |
 | `--force` | Bypass YNAB's import_id deduplication. Use to reimport transactions deleted from YNAB. Does not bypass local processed_emails tracking. |
 | `--clear-cache` | Clear Claude's classification cache before running. Forces re-analysis of all emails. Useful after prompt changes. |
-| `--refresh-payees` | Force refresh of YNAB payee cache. Normally auto-refreshes after 24 hours using delta updates. |
 | `--undo` | Undo the most recent run by deleting its transactions from YNAB and removing processed email records. |
 
-Flags can be combined: `uv run fastmail2ynab.py --force --refresh-payees`
+Flags can be combined: `uv run fastmail2ynab.py --force --clear-cache`
 
 ## Verification
 

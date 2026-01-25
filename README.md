@@ -56,7 +56,6 @@ Dependencies are declared inline in the script using PEP 723, so uv handles them
 | `--dry-run` | Preview what transactions would be created without actually creating them or marking emails as processed. |
 | `--force` | Bypass YNAB's duplicate detection. Use to reimport transactions that were deleted from YNAB. |
 | `--clear-cache` | Clear Claude's classification cache and re-analyze all emails. Useful if you've updated scoring criteria. |
-| `--refresh-payees` | Force refresh of YNAB payee cache. By default, payees are cached for 24 hours with delta updates. |
 | `--undo` | Undo the most recent run by deleting its transactions from YNAB and removing processed email records. |
 
 Examples:
@@ -73,9 +72,6 @@ uv run fastmail2ynab.py --force
 
 # Re-analyze all emails with fresh Claude classifications
 uv run fastmail2ynab.py --clear-cache
-
-# Force refresh payee list from YNAB
-uv run fastmail2ynab.py --refresh-payees
 
 # Undo the last run (delete transactions from YNAB)
 uv run fastmail2ynab.py --undo
@@ -211,8 +207,7 @@ If not configured, Amazon transactions go to the default account like everything
 - If you need to reimport a deleted transaction, use `--force`
 
 **Payee names not matching**
-- Payee cache refreshes every 24 hours automatically
-- Use `--refresh-payees` to force an immediate refresh
+- Payee cache refreshes every 24 hours automatically using delta updates
 - Fuzzy matching uses 80% similarity threshold
 
 **Want to re-analyze emails with Claude**

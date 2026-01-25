@@ -37,9 +37,6 @@ Usage:
     # Clear Claude's classification cache and re-analyze everything
     uv run fastmail2ynab.py --clear-cache
 
-    # Force refresh of YNAB payee cache
-    uv run fastmail2ynab.py --refresh-payees
-
     # Undo the most recent run (delete transactions from YNAB)
     uv run fastmail2ynab.py --undo
 
@@ -1398,27 +1395,24 @@ def is_payee_cache_stale() -> bool:
         return True  # Invalid timestamp, treat as stale
 
 
-def refresh_payee_cache_if_needed(token: str, budget_id: str, force: bool = False) -> list[str]:
-    """Refresh the payee cache if stale or forced, return list of payee names.
+def refresh_payee_cache_if_needed(token: str, budget_id: str) -> list[str]:
+    """Refresh the payee cache if stale, return list of payee names.
 
     The cache is refreshed if:
     - Cache is empty (first run)
     - Cache is older than 24 hours
-    - force=True (user passed --refresh-payees)
 
     Uses delta updates when possible to minimize API data transfer.
 
     Args:
         token: YNAB personal access token.
         budget_id: Target budget UUID.
-        force: If True, force a refresh even if cache is fresh.
 
     Returns:
         List of payee name strings.
     """
-    if force or is_payee_cache_stale():
-        action = "Force refreshing" if force else "Refreshing stale"
-        print(f"  {action} YNAB payee cache...")
+    if is_payee_cache_stale():
+        print("  Refreshing stale YNAB payee cache...")
         payees, server_knowledge = fetch_ynab_payees(token, budget_id)
         cache_ynab_payees(payees, server_knowledge)
         print(f"  Cached {len(payees)} payees from YNAB")
@@ -1462,7 +1456,7 @@ def match_payee_name(
 # =============================================================================
 
 
-def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: bool = False):
+def process_emails(force: bool = False, dry_run: bool = False):
     """Main entry point: fetch emails, classify, and create YNAB transactions.
 
     Processing flow for each email:
@@ -1482,7 +1476,6 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
             unique import IDs. Use this to reimport transactions that were
             previously deleted from YNAB but are still in our processed_emails
             table. Does NOT bypass our own processed_emails check.
-        refresh_payees: If True, force refresh of the YNAB payee cache.
         dry_run: If True, show what would be created without actually creating
             transactions or marking emails as processed.
     """
@@ -1510,7 +1503,6 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
     payee_names = refresh_payee_cache_if_needed(
         CONFIG["ynab_token"],
         CONFIG["ynab_budget_id"],
-        force=refresh_payees,
     )
     print(f"Using {len(payee_names)} cached YNAB payees for matching")
 
@@ -1831,14 +1823,6 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--refresh-payees",
-        action="store_true",
-        help=(
-            "Force refresh of YNAB payee cache (normally uses cached data "
-            "with delta updates, refreshing automatically after 24 hours)."
-        ),
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -1870,4 +1854,4 @@ if __name__ == "__main__":
         print("Cache cleared.")
         print()
 
-    process_emails(force=args.force, refresh_payees=args.refresh_payees, dry_run=args.dry_run)
+    process_emails(force=args.force, dry_run=args.dry_run)
