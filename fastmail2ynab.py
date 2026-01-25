@@ -1030,7 +1030,7 @@ Rules:
 - "amount" must be a positive number (no currency symbols), or null if not found
 - "date" must be YYYY-MM-DD format. Use the transaction date, not the email date. Use null if not found.
 - "merchant" should be the business/source name as it appears in the email, or null if not found
-- "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "PC", etc. Only use a value from the provided list.
+- "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "Co.", etc. Only use a value from the provided list.
 - "description" should briefly describe the transaction
 
 Examples of OUTFLOW: purchase receipts, subscription charges, bill payments, fees
