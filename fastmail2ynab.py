@@ -214,6 +214,40 @@ class PendingTransaction:
     is_inflow: bool
 
 
+def validate_transaction_date(date_str: str | None, email_received_at: str) -> str | None:
+    """Validate and fix transaction date for YNAB constraints.
+
+    YNAB requires dates to be:
+    - Not in the future
+    - Not more than 5 years ago
+
+    Returns a valid YYYY-MM-DD date string, or None if unrecoverable.
+    """
+    today = datetime.now().date()
+    five_years_ago = today - timedelta(days=5 * 365)
+
+    # Try the extracted date first
+    if date_str:
+        try:
+            parsed = datetime.strptime(date_str, "%Y-%m-%d").date()
+            if five_years_ago <= parsed <= today:
+                return date_str  # Valid date
+        except ValueError:
+            pass  # Invalid format, fall through
+
+    # Fall back to email received date
+    try:
+        received_dt = datetime.fromisoformat(email_received_at.replace("Z", "+00:00"))
+        fallback = received_dt.strftime("%Y-%m-%d")
+        parsed = datetime.strptime(fallback, "%Y-%m-%d").date()
+        if five_years_ago <= parsed <= today:
+            return fallback
+    except (ValueError, AttributeError):
+        pass
+
+    return None  # Unrecoverable
+
+
 # =============================================================================
 # HTML Processing
 # =============================================================================
@@ -1531,19 +1565,20 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
                 continue
 
             # Determine transaction date
-            # Prefer: date extracted from email content (actual transaction date)
-            # Fallback: email received timestamp (may be delayed from actual transaction)
-            transaction_date = result.date
+            # Validates date format and YNAB constraints (not future, not >5 years old)
+            # Falls back to email received date if extracted date is invalid
+            transaction_date = validate_transaction_date(result.date, email.received_at)
             if not transaction_date:
-                try:
-                    received_dt = datetime.fromisoformat(email.received_at.replace("Z", "+00:00"))
-                    transaction_date = received_dt.strftime("%Y-%m-%d")
+                print("    -> Invalid date and could not recover, skipping")
+                if not dry_run:
+                    non_receipt_emails.append(email.id)
+                continue
+
+            if transaction_date != result.date:
+                if result.date:
+                    print(f"    -> Date adjusted: {result.date} -> {transaction_date}")
+                else:
                     print(f"    -> No transaction date found, using email date: {transaction_date}")
-                except ValueError:
-                    print("    -> Missing date and could not parse email date, skipping")
-                    if not dry_run:
-                        non_receipt_emails.append(email.id)
-                    continue
 
             sign = "+" if result.is_inflow else "-"
             print(
