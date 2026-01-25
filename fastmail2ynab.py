@@ -1488,6 +1488,8 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
     pending_transactions: list[PendingTransaction] = []
     # Track non-receipt emails to mark as processed after batch creation
     non_receipt_emails: list[str] = []
+    # Collect dry-run transactions for table display: (date, payee, amount, is_inflow, score)
+    dry_run_transactions: list[tuple[str, str, float, bool, int]] = []
 
     for email in emails:
         # Skip emails we've already processed
@@ -1571,6 +1573,9 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
 
             if dry_run:
                 print(f"    -> [DRY RUN] Would create: {final_payee} {sign}${result.amount:.2f}")
+                dry_run_transactions.append(
+                    (transaction_date, final_payee, result.amount, result.is_inflow, result.score)
+                )
                 receipts_added += 1
             else:
                 # Add to pending transactions for batch creation
@@ -1632,6 +1637,25 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
 
         # Complete the run
         complete_run(run_id, receipts_added)
+
+    # Print dry-run transaction table
+    if dry_run and dry_run_transactions:
+        print()
+        print("Transactions that would be created:")
+
+        # Calculate column widths
+        max_payee_len = max(len(payee) for _, payee, _, _, _ in dry_run_transactions)
+        payee_width = max(max_payee_len, 5)  # minimum "Payee" header width
+
+        # Print header
+        print(f"{'Date':<10}  {'Payee':<{payee_width}}  {'Amount':>9}  {'Score':>5}")
+        print(f"{'-' * 10}  {'-' * payee_width}  {'-' * 9}  {'-' * 5}")
+
+        # Print rows
+        for date, payee, amount, is_inflow, score in dry_run_transactions:
+            sign = "+" if is_inflow else "-"
+            amount_str = f"{sign}${amount:.2f}"
+            print(f"{date:<10}  {payee:<{payee_width}}  {amount_str:>9}  {score:>5}")
 
     # Print summary statistics
     print()
