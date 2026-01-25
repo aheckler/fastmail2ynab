@@ -1570,6 +1570,8 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
             if result.description:
                 memo_parts.append(result.description)
             memo = " | ".join(memo_parts)
+            if len(memo) > 200:
+                memo = memo[:197] + "..."
 
             if dry_run:
                 print(f"    -> [DRY RUN] Would create: {final_payee} {sign}${result.amount:.2f}")
@@ -1585,7 +1587,7 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
                         account_id=account_id,
                         amount=result.amount,
                         date=transaction_date,
-                        payee_name=final_payee,
+                        payee_name=final_payee[:50],
                         memo=memo,
                         import_id=import_id,
                         is_inflow=result.is_inflow,
