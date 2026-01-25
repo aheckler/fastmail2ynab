@@ -1613,7 +1613,7 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
             import_id = generate_import_id(email.id, result.amount, transaction_date, force=force)
 
             # Build memo with metadata for reference in YNAB
-            memo = f"Imported by fastmail2ynab | Score: {result.score}/10"
+            memo = f"fm2ynab | Score: {result.score}/10"
 
             # Store display data for summary table
             transaction_display_data[email.id] = (
