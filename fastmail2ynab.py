@@ -37,16 +37,20 @@ Usage:
     # Clear Claude's classification cache and re-analyze everything
     uv run fastmail2ynab.py --clear-cache
 
+    # Force refresh of YNAB payee cache
+    uv run fastmail2ynab.py --refresh-payees
+
     # Undo the most recent run (delete transactions from YNAB)
     uv run fastmail2ynab.py --undo
 
 Environment Variables (in .env file):
-    FASTMAIL_TOKEN    - Fastmail API token with mail read access
-    ANTHROPIC_API_KEY - Claude API key
-    YNAB_TOKEN        - YNAB personal access token
-    YNAB_BUDGET_ID    - Target budget UUID
-    YNAB_ACCOUNT_ID   - Target account UUID (e.g., credit card)
-    MIN_SCORE         - Minimum AI confidence to import (default: 6)
+    FASTMAIL_TOKEN         - Fastmail API token with mail read access
+    ANTHROPIC_API_KEY      - Claude API key
+    YNAB_TOKEN             - YNAB personal access token
+    YNAB_BUDGET_ID         - Target budget UUID
+    YNAB_ACCOUNT_ID        - Target account UUID (e.g., credit card)
+    YNAB_AMAZON_ACCOUNT_ID - Optional: separate account for Amazon transactions
+    MIN_SCORE              - Minimum AI confidence to import (default: 6)
 """
 
 # =============================================================================

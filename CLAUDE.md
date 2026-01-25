@@ -76,7 +76,7 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, date, inflow/outflow)
 3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching
 4. **Payee name matching**: Normalizes merchant names to match existing YNAB payees using fuzzy matching (`difflib`)
-5. **Amazon routing**: Transactions from Amazon are automatically routed to a separate YNAB account (detected via merchant name or sender email)
+5. **Amazon routing**: If configured, transactions from Amazon are routed to a separate YNAB account (detected via merchant name or sender email)
 6. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata), `runs` (script execution history for undo)
 
 ## Key Data Structures

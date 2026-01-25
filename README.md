@@ -126,11 +126,12 @@ launchctl unload ~/Library/LaunchAgents/com.user.fastmail2ynab.plist
 
 ## Configuration
 
-Edit `.env` to adjust:
+Edit `.env` to adjust optional settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MIN_SCORE` | 6 | Minimum AI score (1-10) to import a transaction |
+| `YNAB_AMAZON_ACCOUNT_ID` | (none) | Route Amazon transactions to a separate account |
 
 ## How scoring works
 
@@ -152,11 +153,7 @@ Claude also determines whether each transaction is:
 
 This is reflected correctly in YNAB—outflows show as negative amounts, inflows as positive.
 
-Each imported transaction includes in the memo field:
-- `IMPORTED FROM AI SCRIPT` marker
-- The AI confidence score (e.g., `Score: 8/10`)
-- Direction (`INFLOW` or `OUTFLOW`)
-- A brief description of the transaction
+Each imported transaction includes a memo in the format: `fm2ynab | Score: 8/10`
 
 ## Data storage
 
@@ -183,13 +180,13 @@ This ensures transactions use your existing payee names for consistent categoriz
 
 ## Amazon Routing
 
-Transactions from Amazon are automatically routed to a separate YNAB account. This is useful if you pay for Amazon purchases with a store card or gift card balance rather than your primary credit card.
+If `YNAB_AMAZON_ACCOUNT_ID` is set in `.env`, transactions from Amazon are automatically routed to that account instead of the default. This is useful if you pay for Amazon purchases with a store card or gift card balance.
 
 Detection checks both:
 - Merchant name contains "amazon" (case-insensitive)
 - Sender email contains "amazon" (e.g., @amazon.com, @amazon.co.uk)
 
-The Amazon account ID is configured in the script as `AMAZON_ACCOUNT_ID`.
+If not configured, Amazon transactions go to the default account like everything else.
 
 ## Costs
 
