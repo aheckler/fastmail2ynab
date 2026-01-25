@@ -18,7 +18,7 @@ This script integrates three systems to automate personal finance tracking:
     3. YNAB (API) - Creates unapproved transactions for review
 
 The workflow:
-    - Fetch emails from the last N hours (configurable)
+    - Fetch the 100 most recent emails from inbox
     - For each unprocessed email, ask Claude to score it (1-10) as a receipt
     - If score meets threshold, extract merchant/amount/date
     - Create an unapproved transaction in YNAB
@@ -46,7 +46,6 @@ Environment Variables (in .env file):
     YNAB_TOKEN        - YNAB personal access token
     YNAB_BUDGET_ID    - Target budget UUID
     YNAB_ACCOUNT_ID   - Target account UUID (e.g., credit card)
-    HOURS_BACK        - How far back to scan (default: 24)
     MIN_SCORE         - Minimum AI confidence to import (default: 6)
 """
 
@@ -110,7 +109,6 @@ CONFIG = {
     "ynab_budget_id": os.getenv("YNAB_BUDGET_ID"),  # Budget to add transactions to
     "ynab_account_id": os.getenv("YNAB_ACCOUNT_ID"),  # Account (e.g., credit card)
     # Processing settings
-    "hours_back": safe_int(os.getenv("HOURS_BACK"), 24),  # How far back to scan emails
     "min_score": safe_int(os.getenv("MIN_SCORE"), 6),  # Min AI score (1-10) to import
 }
 
@@ -736,24 +734,23 @@ def jmap_request(api_url: str, token: str, method_calls: list, debug_label: str 
     return result
 
 
-def fetch_recent_emails(token: str, hours_back: int) -> list[Email]:
-    """Fetch recent emails from the Fastmail inbox.
+def fetch_recent_emails(token: str) -> list[Email]:
+    """Fetch the 100 most recent emails from the Fastmail inbox.
 
     Performs a three-step JMAP workflow:
     1. Get session (authentication + API URL)
     2. Find Inbox mailbox ID
     3. Query and fetch emails
 
-    Date filtering happens in Python because Fastmail's JMAP implementation
-    doesn't support date-based query filters. We fetch the 100 most recent
-    emails and discard those outside the time window.
+    Fetches the 100 most recent emails. Already-processed emails are
+    filtered out by the caller, so multiple runs will catch up on
+    any backlog.
 
     Args:
         token: Fastmail API bearer token.
-        hours_back: Only return emails received within this many hours.
 
     Returns:
-        List of Email objects for emails within the time window.
+        List of Email objects for the 100 most recent inbox emails.
 
     Raises:
         ValueError: If the Inbox mailbox cannot be found.
@@ -763,9 +760,6 @@ def fetch_recent_emails(token: str, hours_back: int) -> list[Email]:
     session = get_jmap_session(token)
     api_url = session["apiUrl"]
     account_id = session["primaryAccounts"]["urn:ietf:params:jmap:mail"]
-
-    cutoff_time = datetime.now(UTC) - timedelta(hours=hours_back)
-    print(f"  [DEBUG] Looking for emails after: {cutoff_time.isoformat()}")
 
     # Step 2: Find the Inbox mailbox ID
     # Mailbox/query finds mailboxes by name
@@ -859,20 +853,8 @@ def fetch_recent_emails(token: str, hours_back: int) -> list[Email]:
     )
 
     emails = []
-    skipped_old = 0
 
     for email_data in email_response["methodResponses"][0][1].get("list", []):
-        # Filter by date in Python (since JMAP query doesn't support it)
-        received_at_str = email_data.get("receivedAt", "")
-        if received_at_str:
-            try:
-                received_at = datetime.fromisoformat(received_at_str.replace("Z", "+00:00"))
-                if received_at < cutoff_time:
-                    skipped_old += 1
-                    continue
-            except ValueError:
-                pass  # If we can't parse the date, include the email anyway
-
         # Extract body content in preference order:
         # 1. Plain text body (cleanest for AI analysis)
         # 2. HTML body (stripped to plain text)
@@ -912,7 +894,7 @@ def fetch_recent_emails(token: str, hours_back: int) -> list[Email]:
             )
         )
 
-    print(f"  [DEBUG] After date filtering: {len(emails)} recent, {skipped_old} older than cutoff")
+    print(f"  [DEBUG] Fetched {len(emails)} emails")
     return emails
 
 
@@ -1491,8 +1473,8 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
     client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
 
     # Fetch recent emails from Fastmail
-    print(f"Fetching emails from last {CONFIG['hours_back']} hours...")
-    emails = fetch_recent_emails(CONFIG["fastmail_token"], CONFIG["hours_back"])
+    print("Fetching emails from inbox...")
+    emails = fetch_recent_emails(CONFIG["fastmail_token"])
     print(f"Found {len(emails)} emails in Inbox")
 
     # Statistics counters

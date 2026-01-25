@@ -84,7 +84,6 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 Environment variables in `.env`:
 - `FASTMAIL_TOKEN`, `ANTHROPIC_API_KEY`, `YNAB_TOKEN` - API credentials
 - `YNAB_BUDGET_ID`, `YNAB_ACCOUNT_ID` - Target YNAB account
-- `HOURS_BACK` (default 24) - How far back to scan emails
 - `MIN_SCORE` (default 6) - Minimum AI confidence score to import
 
 ## Dependencies

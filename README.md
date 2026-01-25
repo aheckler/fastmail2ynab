@@ -130,7 +130,6 @@ Edit `.env` to adjust:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HOURS_BACK` | 24 | How far back to scan for emails |
 | `MIN_SCORE` | 6 | Minimum AI score (1-10) to import a transaction |
 
 ## How scoring works
