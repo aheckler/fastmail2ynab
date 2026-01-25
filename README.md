@@ -54,7 +54,7 @@ Dependencies are declared inline in the script using PEP 723, so uv handles them
 | Flag | Description |
 |------|-------------|
 | `--dry-run` | Preview what transactions would be created without actually creating them or marking emails as processed. |
-| `--force` | Bypass YNAB's duplicate detection. Use to reimport transactions that were deleted from YNAB. |
+| `--force` | Reprocess all emails and bypass YNAB's duplicate detection. Use to reimport transactions deleted from YNAB. |
 | `--clear-cache` | Clear Claude's classification cache and re-analyze all emails. Useful if you've updated scoring criteria. |
 | `--undo` | Undo the most recent run by deleting its transactions from YNAB and removing processed email records. |
 

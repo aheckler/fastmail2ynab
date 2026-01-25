@@ -31,7 +31,7 @@ Usage:
     # Preview what would be imported without creating transactions
     uv run fastmail2ynab.py --dry-run
 
-    # Force reimport (bypass YNAB's duplicate detection)
+    # Force reimport (reprocess all emails, bypass YNAB duplicate detection)
     uv run fastmail2ynab.py --force
 
     # Clear Claude's classification cache and re-analyze everything
@@ -1472,10 +1472,9 @@ def process_emails(force: bool = False, dry_run: bool = False):
     10. Mark emails as processed in our database
 
     Args:
-        force: If True, bypass YNAB's import_id deduplication by generating
-            unique import IDs. Use this to reimport transactions that were
-            previously deleted from YNAB but are still in our processed_emails
-            table. Does NOT bypass our own processed_emails check.
+        force: If True, reprocess all emails even if already in processed_emails,
+            and bypass YNAB's import_id deduplication. Use this to reimport
+            transactions that were previously deleted from YNAB.
         dry_run: If True, show what would be created without actually creating
             transactions or marking emails as processed.
     """
@@ -1531,8 +1530,8 @@ def process_emails(force: bool = False, dry_run: bool = False):
     created_email_ids: list[str] = []
 
     for email in emails:
-        # Skip emails we've already processed
-        if is_processed(email.id):
+        # Skip emails we've already processed (unless force mode)
+        if not force and is_processed(email.id):
             print(f"  [SKIP] Already processed: {email.subject[:50]}")
             skipped += 1
             continue
@@ -1808,9 +1807,8 @@ if __name__ == "__main__":
         "--force",
         action="store_true",
         help=(
-            "Bypass YNAB's import_id deduplication. Use this to reimport "
-            "transactions that were deleted from YNAB. Does not bypass our "
-            "local processed_emails tracking."
+            "Reprocess all emails and bypass YNAB's duplicate detection. "
+            "Use this to reimport transactions that were deleted from YNAB."
         ),
     )
     parser.add_argument(
