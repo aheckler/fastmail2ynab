@@ -56,7 +56,6 @@ Environment Variables (in .env file):
 
 # Standard library
 import argparse
-import difflib
 import hashlib
 import json
 import os
@@ -168,6 +167,8 @@ class ClassificationResult:
             True = money coming in (refunds, credits, payments received)
             False = money going out (purchases, bills, subscriptions)
         merchant: Business or source name (e.g., "Amazon", "Uber").
+        matched_payee: Existing YNAB payee name that best matches the merchant,
+            or None if no good match was found.
         amount: Transaction amount as a positive float (e.g., 29.99).
         currency: Three-letter currency code (e.g., "USD", "GBP").
         date: Transaction date in YYYY-MM-DD format.
@@ -178,6 +179,7 @@ class ClassificationResult:
     score: int
     is_inflow: bool = False
     merchant: str | None = None
+    matched_payee: str | None = None
     amount: float | None = None
     currency: str | None = None
     date: str | None = None
@@ -373,6 +375,7 @@ def init_db():
                 score INTEGER,
                 is_inflow INTEGER,
                 merchant TEXT,
+                matched_payee TEXT,
                 amount REAL,
                 currency TEXT,
                 date TEXT,
@@ -429,7 +432,7 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """SELECT score, is_inflow, merchant, amount, currency, date, description, reasoning
+            """SELECT score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning
                FROM classification_cache WHERE email_id = ?""",
             (email_id,),
         )
@@ -442,11 +445,12 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
         score=row[0],
         is_inflow=bool(row[1]),
         merchant=row[2],
-        amount=row[3],
-        currency=row[4],
-        date=row[5],
-        description=row[6],
-        reasoning=row[7],
+        matched_payee=row[3],
+        amount=row[4],
+        currency=row[5],
+        date=row[6],
+        description=row[7],
+        reasoning=row[8],
     )
 
 
@@ -463,14 +467,15 @@ def cache_classification(email_id: str, result: ClassificationResult):
         cursor = conn.cursor()
         cursor.execute(
             """INSERT OR REPLACE INTO classification_cache
-               (email_id, classified_at, score, is_inflow, merchant, amount, currency, date, description, reasoning)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (email_id, classified_at, score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 email_id,
                 datetime.now(UTC).isoformat(),
                 result.score,
                 int(result.is_inflow),
                 result.merchant,
+                result.matched_payee,
                 result.amount,
                 result.currency,
                 result.date,
@@ -945,13 +950,16 @@ def fetch_recent_emails(token: str) -> list[Email]:
 # =============================================================================
 
 
-def classify_email(email: Email, client: anthropic.Anthropic) -> ClassificationResult:
+def classify_email(
+    email: Email, client: anthropic.Anthropic, payee_names: list[str]
+) -> ClassificationResult:
     """Use Claude to analyze an email and extract transaction details.
 
     Sends the email content to Claude with a structured prompt asking for:
     - A confidence score (1-10) that this is a financial transaction
     - Transaction direction (inflow = money received, outflow = money spent)
     - Structured data: merchant, amount, currency, date, description
+    - Payee matching: match merchant to existing YNAB payee if possible
 
     The prompt includes a scoring rubric:
         1-3: Not a transaction (marketing, shipping updates, etc.)
@@ -962,6 +970,7 @@ def classify_email(email: Email, client: anthropic.Anthropic) -> ClassificationR
     Args:
         email: The email to classify.
         client: Initialized Anthropic client.
+        payee_names: List of existing YNAB payee names for matching.
 
     Returns:
         ClassificationResult with score and extracted data.
@@ -969,6 +978,11 @@ def classify_email(email: Email, client: anthropic.Anthropic) -> ClassificationR
     """
     # Truncate body to avoid token limits (8000 chars ≈ 2000 tokens)
     truncated_body = email.body[:8000]
+
+    # Format payee list for the prompt (limit to avoid token bloat)
+    # Sort alphabetically for easier scanning by Claude
+    sorted_payees = sorted(payee_names)
+    payee_list = "\n".join(sorted_payees[:500])  # Cap at 500 payees
 
     # Structured prompt asking for JSON output
     # Includes scoring rubric and field definitions
@@ -979,6 +993,11 @@ SUBJECT: {email.subject}
 
 BODY:
 {truncated_body}
+
+---
+
+EXISTING PAYEES (for matching):
+{payee_list}
 
 ---
 
@@ -997,6 +1016,7 @@ Respond with JSON in this exact format:
   "score": 8,
   "direction": "outflow",
   "merchant": "Store Name or Source",
+  "matched_payee": "Existing Payee Name",
   "amount": 29.99,
   "currency": "USD",
   "date": "2024-01-15",
@@ -1009,7 +1029,8 @@ Rules:
 - "direction" must be either "inflow" or "outflow"
 - "amount" must be a positive number (no currency symbols), or null if not found
 - "date" must be YYYY-MM-DD format. Use the transaction date, not the email date. Use null if not found.
-- "merchant" should be the business/source name, or null if not found
+- "merchant" should be the business/source name as it appears in the email, or null if not found
+- "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "PC", etc. Only use a value from the provided list.
 - "description" should briefly describe the transaction
 
 Examples of OUTFLOW: purchase receipts, subscription charges, bill payments, fees
@@ -1046,6 +1067,7 @@ Respond ONLY with valid JSON, no other text."""
             score=int(data.get("score", 0)),
             is_inflow=(direction == "inflow"),
             merchant=data.get("merchant"),
+            matched_payee=data.get("matched_payee"),
             amount=float(data["amount"]) if data.get("amount") else None,
             currency=data.get("currency", "USD"),
             date=data.get("date"),
@@ -1420,37 +1442,6 @@ def refresh_payee_cache_if_needed(token: str, budget_id: str) -> list[str]:
     return get_cached_payees()
 
 
-def match_payee_name(
-    merchant: str, existing_payees: list[str], threshold: float = 0.8
-) -> str | None:
-    """Match a merchant name to an existing YNAB payee.
-
-    First tries an exact case-insensitive match, then falls back to
-    fuzzy matching using difflib's sequence matcher.
-
-    Args:
-        merchant: The merchant name extracted by Claude.
-        existing_payees: List of existing payee names from YNAB.
-        threshold: Minimum similarity ratio for fuzzy matching (0-1).
-
-    Returns:
-        Matched payee name if found, None otherwise.
-    """
-    if not merchant or not existing_payees:
-        return None
-
-    merchant_lower = merchant.lower()
-
-    # First try exact case-insensitive match
-    for payee in existing_payees:
-        if payee.lower() == merchant_lower:
-            return payee
-
-    # Fall back to fuzzy matching
-    matches = difflib.get_close_matches(merchant, existing_payees, n=1, cutoff=threshold)
-    return matches[0] if matches else None
-
-
 # =============================================================================
 # Main Processing
 # =============================================================================
@@ -1546,7 +1537,7 @@ def process_emails(force: bool = False, dry_run: bool = False):
                 cached += 1
             else:
                 # No cache hit - call Claude API and cache the result
-                result = classify_email(email, client)
+                result = classify_email(email, client, payee_names)
                 cache_classification(email.id, result)
 
             direction_str = "INFLOW" if result.is_inflow else "OUTFLOW"
@@ -1589,14 +1580,10 @@ def process_emails(force: bool = False, dry_run: bool = False):
                 f"    -> Importing: {result.merchant} {sign}${result.amount:.2f} on {transaction_date}"
             )
 
-            # Match merchant name to existing YNAB payee for consistent naming
-            final_payee = (
-                match_payee_name(result.merchant, payee_names)
-                if result.merchant
-                else None
-            ) or result.merchant or "Unknown"
-            if final_payee != result.merchant and result.merchant:
-                print(f"    -> Matched payee: '{result.merchant}' -> '{final_payee}'")
+            # Use Claude's matched payee if available, otherwise fall back to merchant name
+            final_payee = result.matched_payee or result.merchant or "Unknown"
+            if result.matched_payee and result.matched_payee != result.merchant:
+                print(f"    -> Matched payee: '{result.merchant}' -> '{result.matched_payee}'")
 
             # Determine which account to use (Amazon routing)
             account_id = get_account_for_transaction(result.merchant, email.from_email)

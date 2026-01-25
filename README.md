@@ -167,10 +167,11 @@ Delete this file to start fresh and reprocess all emails.
 
 ## Payee Matching
 
-When creating transactions, the script attempts to match Claude's extracted merchant name to existing YNAB payees:
+When classifying emails, Claude matches the extracted merchant name to your existing YNAB payees. This handles:
 
-1. **Exact match** (case-insensitive): "AMAZON.COM" matches "Amazon.com"
-2. **Fuzzy match** (80% similarity threshold): "Amazon.com" matches "Amazon"
+- **Abbreviations**: "Willow Creek Homeowners Association" → "Willow Creek HOA"
+- **Suffixes**: "Anthropic PC" → "Anthropic" (ignores Inc, LLC, PC, etc.)
+- **Common variations**: Different capitalizations, punctuation, etc.
 
 This ensures transactions use your existing payee names for consistent categorization and reporting.
 
@@ -208,7 +209,7 @@ If not configured, Amazon transactions go to the default account like everything
 
 **Payee names not matching**
 - Payee cache refreshes every 24 hours automatically using delta updates
-- Fuzzy matching uses 80% similarity threshold
+- Use `--clear-cache` to re-classify emails if you've added new payees to YNAB
 
 **Want to re-analyze emails with Claude**
 - Use `--clear-cache` to clear classifications and re-analyze all emails
