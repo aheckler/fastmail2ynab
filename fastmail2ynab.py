@@ -65,16 +65,14 @@ import sqlite3
 import traceback
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Optional
 
 # Third-party
 import anthropic
 import requests
 from dotenv import load_dotenv
-
 
 # =============================================================================
 # Configuration & Constants
@@ -105,17 +103,15 @@ load_dotenv()
 # Configuration dictionary - all settings loaded from environment
 CONFIG = {
     # API credentials
-    "fastmail_token": os.getenv("FASTMAIL_TOKEN"),      # Fastmail JMAP bearer token
+    "fastmail_token": os.getenv("FASTMAIL_TOKEN"),  # Fastmail JMAP bearer token
     "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY"),  # Claude API key
-    "ynab_token": os.getenv("YNAB_TOKEN"),              # YNAB personal access token
-
+    "ynab_token": os.getenv("YNAB_TOKEN"),  # YNAB personal access token
     # YNAB target location
-    "ynab_budget_id": os.getenv("YNAB_BUDGET_ID"),      # Budget to add transactions to
-    "ynab_account_id": os.getenv("YNAB_ACCOUNT_ID"),    # Account (e.g., credit card)
-
+    "ynab_budget_id": os.getenv("YNAB_BUDGET_ID"),  # Budget to add transactions to
+    "ynab_account_id": os.getenv("YNAB_ACCOUNT_ID"),  # Account (e.g., credit card)
     # Processing settings
     "hours_back": safe_int(os.getenv("HOURS_BACK"), 24),  # How far back to scan emails
-    "min_score": safe_int(os.getenv("MIN_SCORE"), 6),     # Min AI score (1-10) to import
+    "min_score": safe_int(os.getenv("MIN_SCORE"), 6),  # Min AI score (1-10) to import
 }
 
 # Database path - stored alongside the script for easy backup/inspection
@@ -124,7 +120,7 @@ DB_PATH = Path(__file__).parent / "processed_emails.db"
 
 # API endpoint URLs
 FASTMAIL_JMAP_URL = "https://api.fastmail.com/jmap/session"  # JMAP session endpoint
-YNAB_BASE_URL = "https://api.ynab.com/v1"                    # YNAB REST API base
+YNAB_BASE_URL = "https://api.ynab.com/v1"  # YNAB REST API base
 
 # Amazon routing - transactions from Amazon go to a separate account
 AMAZON_ACCOUNT_ID = "7a08b54c-754f-40dc-89d6-994872eddfea"
@@ -184,12 +180,12 @@ class ClassificationResult:
 
     score: int
     is_inflow: bool = False
-    merchant: Optional[str] = None
-    amount: Optional[float] = None
-    currency: Optional[str] = None
-    date: Optional[str] = None
-    description: Optional[str] = None
-    reasoning: Optional[str] = None
+    merchant: str | None = None
+    amount: float | None = None
+    currency: str | None = None
+    date: str | None = None
+    description: str | None = None
+    reasoning: str | None = None
 
 
 @dataclass
@@ -240,7 +236,7 @@ class HTMLStripper(HTMLParser):
 
     def __init__(self):
         super().__init__()
-        self.text = []   # Accumulates text fragments
+        self.text = []  # Accumulates text fragments
         self.skip = False  # True when inside script/style tags
 
     def handle_starttag(self, tag, attrs):
@@ -390,7 +386,7 @@ def init_db():
         conn.commit()
 
 
-def get_cached_classification(email_id: str) -> Optional[ClassificationResult]:
+def get_cached_classification(email_id: str) -> ClassificationResult | None:
     """Retrieve a cached classification result for an email.
 
     Args:
@@ -404,7 +400,7 @@ def get_cached_classification(email_id: str) -> Optional[ClassificationResult]:
         cursor.execute(
             """SELECT score, is_inflow, merchant, amount, currency, date, description, reasoning
                FROM classification_cache WHERE email_id = ?""",
-            (email_id,)
+            (email_id,),
         )
         row = cursor.fetchone()
 
@@ -440,7 +436,7 @@ def cache_classification(email_id: str, result: ClassificationResult):
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 email_id,
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
                 result.score,
                 int(result.is_inflow),
                 result.merchant,
@@ -449,7 +445,7 @@ def cache_classification(email_id: str, result: ClassificationResult):
                 result.date,
                 result.description,
                 result.reasoning,
-            )
+            ),
         )
         conn.commit()
 
@@ -472,8 +468,8 @@ def is_processed(email_id: str) -> bool:
 def mark_processed(
     email_id: str,
     is_receipt: bool,
-    ynab_id: Optional[str] = None,
-    run_id: Optional[str] = None,
+    ynab_id: str | None = None,
+    run_id: str | None = None,
 ):
     """Mark an email as processed.
 
@@ -491,7 +487,7 @@ def mark_processed(
             (email_id, processed_at, is_receipt, ynab_transaction_id, run_id)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (email_id, datetime.now(timezone.utc).isoformat(), int(is_receipt), ynab_id, run_id),
+            (email_id, datetime.now(UTC).isoformat(), int(is_receipt), ynab_id, run_id),
         )
         conn.commit()
 
@@ -522,7 +518,7 @@ def start_run() -> str:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO runs (run_id, started_at) VALUES (?, ?)",
-            (run_id, datetime.now(timezone.utc).isoformat()),
+            (run_id, datetime.now(UTC).isoformat()),
         )
         conn.commit()
     return run_id
@@ -541,12 +537,12 @@ def complete_run(run_id: str, transactions_created: int):
             """UPDATE runs
                SET completed_at = ?, transactions_created = ?
                WHERE run_id = ?""",
-            (datetime.now(timezone.utc).isoformat(), transactions_created, run_id),
+            (datetime.now(UTC).isoformat(), transactions_created, run_id),
         )
         conn.commit()
 
 
-def get_last_run() -> Optional[tuple[str, int]]:
+def get_last_run() -> tuple[str, int] | None:
     """Get the most recent completed run.
 
     Returns:
@@ -612,7 +608,7 @@ def delete_run_records(run_id: str):
 # =============================================================================
 
 
-def is_amazon_transaction(merchant: Optional[str], from_email: str) -> bool:
+def is_amazon_transaction(merchant: str | None, from_email: str) -> bool:
     """Check if a transaction is from Amazon.
 
     Checks both the merchant name and email sender for "amazon".
@@ -629,7 +625,7 @@ def is_amazon_transaction(merchant: Optional[str], from_email: str) -> bool:
     return "amazon" in merchant_lower or "amazon" in email_lower
 
 
-def get_account_for_transaction(merchant: Optional[str], from_email: str) -> str:
+def get_account_for_transaction(merchant: str | None, from_email: str) -> str:
     """Get the YNAB account ID for a transaction.
 
     Routes Amazon transactions to a separate account.
@@ -678,7 +674,7 @@ def get_jmap_session(token: str) -> dict:
     Raises:
         requests.HTTPError: If authentication fails.
     """
-    print(f"  [DEBUG] Connecting to Fastmail JMAP...")
+    print("  [DEBUG] Connecting to Fastmail JMAP...")
     response = requests.get(
         FASTMAIL_JMAP_URL,
         headers={"Authorization": f"Bearer {token}"},
@@ -687,7 +683,9 @@ def get_jmap_session(token: str) -> dict:
     response.raise_for_status()
     session = response.json()
     print(f"  [DEBUG] API URL: {session.get('apiUrl')}")
-    print(f"  [DEBUG] Account ID: {session.get('primaryAccounts', {}).get('urn:ietf:params:jmap:mail')}")
+    print(
+        f"  [DEBUG] Account ID: {session.get('primaryAccounts', {}).get('urn:ietf:params:jmap:mail')}"
+    )
     return session
 
 
@@ -766,7 +764,7 @@ def fetch_recent_emails(token: str, hours_back: int) -> list[Email]:
     api_url = session["apiUrl"]
     account_id = session["primaryAccounts"]["urn:ietf:params:jmap:mail"]
 
-    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+    cutoff_time = datetime.now(UTC) - timedelta(hours=hours_back)
     print(f"  [DEBUG] Looking for emails after: {cutoff_time.isoformat()}")
 
     # Step 2: Find the Inbox mailbox ID
@@ -845,14 +843,14 @@ def fetch_recent_emails(token: str, hours_back: int) -> list[Email]:
                         "receivedAt",
                         "from",
                         "subject",
-                        "preview",      # Short text snippet (fallback)
-                        "textBody",     # Plain text parts
-                        "htmlBody",     # HTML parts
-                        "bodyValues",   # Actual content of body parts
+                        "preview",  # Short text snippet (fallback)
+                        "textBody",  # Plain text parts
+                        "htmlBody",  # HTML parts
+                        "bodyValues",  # Actual content of body parts
                     ],
-                    "fetchTextBodyValues": True,   # Include text body content
-                    "fetchHTMLBodyValues": True,   # Include HTML body content
-                    "maxBodyValueBytes": 50000,    # Limit body size
+                    "fetchTextBodyValues": True,  # Include text body content
+                    "fetchHTMLBodyValues": True,  # Include HTML body content
+                    "maxBodyValueBytes": 50000,  # Limit body size
                 },
                 "2",
             ]
@@ -1082,7 +1080,7 @@ def generate_import_id(email_id: str, amount: float, date: str, force: bool = Fa
     hash_input = email_id.encode()
     if force:
         # Add timestamp to make the ID unique even for the same email
-        hash_input += datetime.now(timezone.utc).isoformat().encode()
+        hash_input += datetime.now(UTC).isoformat().encode()
     hash_hex = hashlib.md5(hash_input).hexdigest()[:8]
     amount_milliunits = abs(int(amount * 1000))
     import_id = f"YNAB:{amount_milliunits}:{date}:{hash_hex}"
@@ -1096,7 +1094,7 @@ def create_ynab_transaction(
     amount: float,
     date: str,
     payee_name: str,
-    memo: Optional[str],
+    memo: str | None,
     import_id: str,
     is_inflow: bool = False,
 ) -> tuple[str, bool]:
@@ -1131,14 +1129,14 @@ def create_ynab_transaction(
 
     # Build transaction payload
     transaction = {
-        "account_id": account_id,         # Which account (credit card, checking, etc.)
-        "date": date,                      # YYYY-MM-DD format
-        "amount": milliunits,              # Amount in milliunits (signed)
-        "payee_name": payee_name,          # Merchant name (YNAB may match to existing)
-        "memo": memo,                      # Our metadata (score, description, etc.)
-        "cleared": "uncleared",            # Not yet matched to bank transaction
-        "approved": False,                 # Requires manual review in YNAB
-        "import_id": import_id,            # For deduplication
+        "account_id": account_id,  # Which account (credit card, checking, etc.)
+        "date": date,  # YYYY-MM-DD format
+        "amount": milliunits,  # Amount in milliunits (signed)
+        "payee_name": payee_name,  # Merchant name (YNAB may match to existing)
+        "memo": memo,  # Our metadata (score, description, etc.)
+        "cleared": "uncleared",  # Not yet matched to bank transaction
+        "approved": False,  # Requires manual review in YNAB
+        "import_id": import_id,  # For deduplication
     }
 
     response = requests.post(
@@ -1191,16 +1189,18 @@ def create_ynab_transactions_batch(
         if not pt.is_inflow:
             milliunits = -milliunits
 
-        transactions.append({
-            "account_id": pt.account_id,
-            "date": pt.date,
-            "amount": milliunits,
-            "payee_name": pt.payee_name,
-            "memo": pt.memo,
-            "cleared": "uncleared",
-            "approved": False,
-            "import_id": pt.import_id,
-        })
+        transactions.append(
+            {
+                "account_id": pt.account_id,
+                "date": pt.date,
+                "amount": milliunits,
+                "payee_name": pt.payee_name,
+                "memo": pt.memo,
+                "cleared": "uncleared",
+                "approved": False,
+                "import_id": pt.import_id,
+            }
+        )
 
     response = requests.post(
         f"{YNAB_BASE_URL}/budgets/{budget_id}/transactions",
@@ -1278,9 +1278,7 @@ def fetch_ynab_payees(token: str, budget_id: str) -> tuple[list[dict], int]:
     # Check for existing server_knowledge for delta updates
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT value FROM ynab_sync_state WHERE key = 'payees_server_knowledge'"
-        )
+        cursor.execute("SELECT value FROM ynab_sync_state WHERE key = 'payees_server_knowledge'")
         row = cursor.fetchone()
         server_knowledge = int(row[0]) if row else None
 
@@ -1324,17 +1322,17 @@ def cache_ynab_payees(payees: list[dict], server_knowledge: int):
                     payee["name"],
                     payee.get("transfer_account_id"),
                     int(payee.get("deleted", False)),
-                )
+                ),
             )
 
         # Update sync state
         cursor.execute(
             "INSERT OR REPLACE INTO ynab_sync_state (key, value) VALUES (?, ?)",
-            ("payees_server_knowledge", str(server_knowledge))
+            ("payees_server_knowledge", str(server_knowledge)),
         )
         cursor.execute(
             "INSERT OR REPLACE INTO ynab_sync_state (key, value) VALUES (?, ?)",
-            ("payees_last_sync", datetime.now(timezone.utc).isoformat())
+            ("payees_last_sync", datetime.now(UTC).isoformat()),
         )
         conn.commit()
 
@@ -1359,9 +1357,7 @@ def is_payee_cache_stale() -> bool:
     """
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT value FROM ynab_sync_state WHERE key = 'payees_last_sync'"
-        )
+        cursor.execute("SELECT value FROM ynab_sync_state WHERE key = 'payees_last_sync'")
         row = cursor.fetchone()
 
     if not row:
@@ -1369,15 +1365,13 @@ def is_payee_cache_stale() -> bool:
 
     try:
         last_sync = datetime.fromisoformat(row[0])
-        age = datetime.now(timezone.utc) - last_sync
+        age = datetime.now(UTC) - last_sync
         return age > timedelta(hours=24)
     except ValueError:
         return True  # Invalid timestamp, treat as stale
 
 
-def refresh_payee_cache_if_needed(
-    token: str, budget_id: str, force: bool = False
-) -> list[str]:
+def refresh_payee_cache_if_needed(token: str, budget_id: str, force: bool = False) -> list[str]:
     """Refresh the payee cache if stale or forced, return list of payee names.
 
     The cache is refreshed if:
@@ -1407,7 +1401,7 @@ def refresh_payee_cache_if_needed(
 
 def match_payee_name(
     merchant: str, existing_payees: list[str], threshold: float = 0.8
-) -> Optional[str]:
+) -> str | None:
     """Match a merchant name to an existing YNAB payee.
 
     First tries an exact case-insensitive match, then falls back to
@@ -1432,9 +1426,7 @@ def match_payee_name(
             return payee
 
     # Fall back to fuzzy matching
-    matches = difflib.get_close_matches(
-        merchant, existing_payees, n=1, cutoff=threshold
-    )
+    matches = difflib.get_close_matches(merchant, existing_payees, n=1, cutoff=threshold)
     return matches[0] if matches else None
 
 
@@ -1505,10 +1497,10 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
 
     # Statistics counters
     receipts_added = 0  # New transactions created in YNAB
-    duplicates = 0      # Skipped due to YNAB import_id conflict
-    skipped = 0         # Skipped due to already in our processed_emails table
-    cached = 0          # Used cached Claude classification (saved API calls)
-    errors = 0          # Processing errors
+    duplicates = 0  # Skipped due to YNAB import_id conflict
+    skipped = 0  # Skipped due to already in our processed_emails table
+    cached = 0  # Used cached Claude classification (saved API calls)
+    errors = 0  # Processing errors
 
     # Collect pending transactions for batch creation
     pending_transactions: list[PendingTransaction] = []
@@ -1528,7 +1520,7 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
             # Check classification cache before calling Claude API
             result = get_cached_classification(email.id)
             if result:
-                print(f"    -> (cached)")
+                print("    -> (cached)")
                 cached += 1
             else:
                 # No cache hit - call Claude API and cache the result
@@ -1536,7 +1528,9 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
                 cache_classification(email.id, result)
 
             direction_str = "INFLOW" if result.is_inflow else "OUTFLOW"
-            print(f"    -> Score: {result.score}/10, Direction: {direction_str} - {result.reasoning or 'N/A'}")
+            print(
+                f"    -> Score: {result.score}/10, Direction: {direction_str} - {result.reasoning or 'N/A'}"
+            )
 
             # Skip if below confidence threshold
             if result.score < CONFIG["min_score"]:
@@ -1568,17 +1562,21 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
                     continue
 
             sign = "+" if result.is_inflow else "-"
-            print(f"    -> Importing: {result.merchant} {sign}${result.amount:.2f} on {transaction_date}")
+            print(
+                f"    -> Importing: {result.merchant} {sign}${result.amount:.2f} on {transaction_date}"
+            )
 
             # Match merchant name to existing YNAB payee for consistent naming
-            final_payee = match_payee_name(result.merchant, payee_names) or result.merchant or "Unknown"
+            final_payee = (
+                match_payee_name(result.merchant, payee_names) or result.merchant or "Unknown"
+            )
             if final_payee != result.merchant and result.merchant:
                 print(f"    -> Matched payee: '{result.merchant}' -> '{final_payee}'")
 
             # Determine which account to use (Amazon routing)
             account_id = get_account_for_transaction(result.merchant, email.from_email)
             if account_id == AMAZON_ACCOUNT_ID:
-                print(f"    -> Routing to Amazon account")
+                print("    -> Routing to Amazon account")
 
             # Generate import_id for YNAB deduplication
             import_id = generate_import_id(email.id, result.amount, transaction_date, force=force)
@@ -1594,16 +1592,18 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
                 receipts_added += 1
             else:
                 # Add to pending transactions for batch creation
-                pending_transactions.append(PendingTransaction(
-                    email_id=email.id,
-                    account_id=account_id,
-                    amount=result.amount,
-                    date=transaction_date,
-                    payee_name=final_payee,
-                    memo=memo,
-                    import_id=import_id,
-                    is_inflow=result.is_inflow,
-                ))
+                pending_transactions.append(
+                    PendingTransaction(
+                        email_id=email.id,
+                        account_id=account_id,
+                        amount=result.amount,
+                        date=transaction_date,
+                        payee_name=final_payee,
+                        memo=memo,
+                        import_id=import_id,
+                        is_inflow=result.is_inflow,
+                    )
+                )
 
         except Exception as e:
             print(f"    -> Error: {e}")
@@ -1623,7 +1623,7 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
         # Process in batches of 5
         batch_size = 5
         for i in range(0, len(pending_transactions), batch_size):
-            batch = pending_transactions[i:i + batch_size]
+            batch = pending_transactions[i : i + batch_size]
             print(f"  Batch {i // batch_size + 1}: {len(batch)} transactions")
 
             try:
@@ -1635,7 +1635,7 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
 
                 for email_id, ynab_id, already_existed in results:
                     if already_existed:
-                        print(f"    -> Already exists in YNAB (duplicate)")
+                        print("    -> Already exists in YNAB (duplicate)")
                         duplicates += 1
                     else:
                         print(f"    -> Created: {ynab_id}")
@@ -1654,9 +1654,13 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
     # Print summary statistics
     print()
     if dry_run:
-        print(f"Dry run complete! {receipts_added} would be created, {skipped} skipped, {cached} from cache, {errors} errors")
+        print(
+            f"Dry run complete! {receipts_added} would be created, {skipped} skipped, {cached} from cache, {errors} errors"
+        )
     else:
-        print(f"Done! {receipts_added} added, {duplicates} already in YNAB, {skipped} skipped, {cached} from cache, {errors} errors")
+        print(
+            f"Done! {receipts_added} added, {duplicates} already in YNAB, {skipped} skipped, {cached} from cache, {errors} errors"
+        )
 
 
 def undo_last_run():
@@ -1697,7 +1701,7 @@ def undo_last_run():
     not_found = 0
     errors = 0
 
-    for email_id, ynab_id in transactions:
+    for _email_id, ynab_id in transactions:
         if not ynab_id:
             not_found += 1
             continue

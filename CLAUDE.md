@@ -38,10 +38,22 @@ Flags can be combined: `uv run fastmail2ynab.py --force --refresh-payees`
 
 ## Verification
 
-After making code changes, verify syntax with:
+After making code changes, run the linter:
 
 ```bash
-python3 -m py_compile fastmail2ynab.py
+uv run ruff check fastmail2ynab.py
+```
+
+To auto-fix issues:
+
+```bash
+uv run ruff check --fix fastmail2ynab.py
+```
+
+To format:
+
+```bash
+uv run ruff format fastmail2ynab.py
 ```
 
 To test the CLI:
