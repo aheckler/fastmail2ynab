@@ -108,6 +108,7 @@ CONFIG = {
     # YNAB target location
     "ynab_budget_id": os.getenv("YNAB_BUDGET_ID"),  # Budget to add transactions to
     "ynab_account_id": os.getenv("YNAB_ACCOUNT_ID"),  # Account (e.g., credit card)
+    "ynab_amazon_account_id": os.getenv("YNAB_AMAZON_ACCOUNT_ID"),  # Optional: separate Amazon account
     # Processing settings
     "min_score": safe_int(os.getenv("MIN_SCORE"), 6),  # Min AI score (1-10) to import
 }
@@ -119,9 +120,6 @@ DB_PATH = Path(__file__).parent / "processed_emails.db"
 # API endpoint URLs
 FASTMAIL_JMAP_URL = "https://api.fastmail.com/jmap/session"  # JMAP session endpoint
 YNAB_BASE_URL = "https://api.ynab.com/v1"  # YNAB REST API base
-
-# Amazon routing - transactions from Amazon go to a separate account
-AMAZON_ACCOUNT_ID = "7a08b54c-754f-40dc-89d6-994872eddfea"
 
 
 # =============================================================================
@@ -635,8 +633,8 @@ def delete_run_records(run_id: str):
 #   - Merchant name contains "amazon" (case-insensitive)
 #   - Sender email contains "amazon" (e.g., @amazon.com, @amazon.co.uk)
 #
-# If either condition matches, the transaction goes to AMAZON_ACCOUNT_ID
-# instead of the default CONFIG["ynab_account_id"].
+# If either condition matches and YNAB_AMAZON_ACCOUNT_ID is configured,
+# the transaction goes to that account instead of the default.
 # =============================================================================
 
 
@@ -660,7 +658,7 @@ def is_amazon_transaction(merchant: str | None, from_email: str) -> bool:
 def get_account_for_transaction(merchant: str | None, from_email: str) -> str:
     """Get the YNAB account ID for a transaction.
 
-    Routes Amazon transactions to a separate account.
+    Routes Amazon transactions to a separate account if configured.
 
     Args:
         merchant: The merchant name extracted by Claude.
@@ -669,8 +667,9 @@ def get_account_for_transaction(merchant: str | None, from_email: str) -> str:
     Returns:
         The YNAB account ID to use for this transaction.
     """
-    if is_amazon_transaction(merchant, from_email):
-        return AMAZON_ACCOUNT_ID
+    amazon_account = CONFIG["ynab_amazon_account_id"]
+    if amazon_account and is_amazon_transaction(merchant, from_email):
+        return amazon_account
     return CONFIG["ynab_account_id"]
 
 
@@ -1606,7 +1605,7 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
 
             # Determine which account to use (Amazon routing)
             account_id = get_account_for_transaction(result.merchant, email.from_email)
-            if account_id == AMAZON_ACCOUNT_ID:
+            if account_id == CONFIG["ynab_amazon_account_id"]:
                 print("    -> Routing to Amazon account")
 
             # Generate import_id for YNAB deduplication
