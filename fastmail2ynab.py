@@ -1227,6 +1227,14 @@ def create_ynab_transactions_batch(
         json={"transactions": transactions},
         timeout=30,
     )
+    if not response.ok:
+        # Extract YNAB error details before raising
+        try:
+            error_data = response.json().get("error", {})
+            error_detail = error_data.get("detail", response.text)
+        except Exception:
+            error_detail = response.text
+        print(f"    -> YNAB API error: {error_detail}")
     response.raise_for_status()
 
     data = response.json()["data"]
