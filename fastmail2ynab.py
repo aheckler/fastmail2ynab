@@ -1530,8 +1530,10 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
     pending_transactions: list[PendingTransaction] = []
     # Track non-receipt emails to mark as processed after batch creation
     non_receipt_emails: list[str] = []
-    # Collect dry-run transactions for table display: (date, payee, amount, is_inflow, score)
-    dry_run_transactions: list[tuple[str, str, float, bool, int]] = []
+    # Track transaction display data by email_id: (date, payee, amount, is_inflow, score)
+    transaction_display_data: dict[str, tuple[str, str, float, bool, int]] = {}
+    # Track which transactions were actually created (not duplicates) by email_id
+    created_email_ids: list[str] = []
 
     for email in emails:
         # Skip emails we've already processed
@@ -1616,11 +1618,18 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
             if len(memo) > 200:
                 memo = memo[:197] + "..."
 
+            # Store display data for summary table
+            transaction_display_data[email.id] = (
+                transaction_date,
+                final_payee,
+                result.amount,
+                result.is_inflow,
+                result.score,
+            )
+
             if dry_run:
                 print(f"    -> [DRY RUN] Would create: {final_payee} {sign}${result.amount:.2f}")
-                dry_run_transactions.append(
-                    (transaction_date, final_payee, result.amount, result.is_inflow, result.score)
-                )
+                created_email_ids.append(email.id)
                 receipts_added += 1
             else:
                 # Add to pending transactions for batch creation
@@ -1672,6 +1681,7 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
                     else:
                         print(f"    -> Created: {ynab_id}")
                         receipts_added += 1
+                        created_email_ids.append(email_id)
 
                     mark_processed(email_id, is_receipt=True, ynab_id=ynab_id, run_id=run_id)
 
@@ -1683,24 +1693,35 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
         # Complete the run
         complete_run(run_id, receipts_added)
 
-    # Print dry-run transaction table
-    if dry_run and dry_run_transactions:
-        print()
-        print("Transactions that would be created:")
+    # Print transaction summary table (for both dry run and live runs)
+    if created_email_ids:
+        # Build list of transactions to display
+        display_transactions = [
+            transaction_display_data[email_id]
+            for email_id in created_email_ids
+            if email_id in transaction_display_data
+        ]
 
-        # Calculate column widths
-        max_payee_len = max(len(payee) for _, payee, _, _, _ in dry_run_transactions)
-        payee_width = max(max_payee_len, 5)  # minimum "Payee" header width
+        if display_transactions:
+            print()
+            if dry_run:
+                print("Transactions that would be created:")
+            else:
+                print("Transactions created:")
 
-        # Print header
-        print(f"{'Date':<10}  {'Payee':<{payee_width}}  {'Amount':>9}  {'Score':>5}")
-        print(f"{'-' * 10}  {'-' * payee_width}  {'-' * 9}  {'-' * 5}")
+            # Calculate column widths
+            max_payee_len = max(len(payee) for _, payee, _, _, _ in display_transactions)
+            payee_width = max(max_payee_len, 5)  # minimum "Payee" header width
 
-        # Print rows
-        for date, payee, amount, is_inflow, score in dry_run_transactions:
-            sign = "+" if is_inflow else "-"
-            amount_str = f"{sign}${amount:.2f}"
-            print(f"{date:<10}  {payee:<{payee_width}}  {amount_str:>9}  {score:>5}")
+            # Print header
+            print(f"{'Date':<10}  {'Payee':<{payee_width}}  {'Amount':>9}  {'Score':>5}")
+            print(f"{'-' * 10}  {'-' * payee_width}  {'-' * 9}  {'-' * 5}")
+
+            # Print rows
+            for date, payee, amount, is_inflow, score in display_transactions:
+                sign = "+" if is_inflow else "-"
+                amount_str = f"{sign}${amount:.2f}"
+                print(f"{date:<10}  {payee:<{payee_width}}  {amount_str:>9}  {score:>5}")
 
     # Print summary statistics
     print()
