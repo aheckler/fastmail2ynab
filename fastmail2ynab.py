@@ -1840,6 +1840,16 @@ if __name__ == "__main__":
 
     # Handle --undo: undo the last run and exit
     if args.undo:
+        other_flags = []
+        if args.force:
+            other_flags.append("--force")
+        if args.clear_cache:
+            other_flags.append("--clear-cache")
+        if args.dry_run:
+            other_flags.append("--dry-run")
+        if other_flags:
+            print(f"Warning: {', '.join(other_flags)} ignored when using --undo")
+            print()
         undo_last_run()
         exit(0)
 
