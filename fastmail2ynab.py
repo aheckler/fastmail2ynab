@@ -1470,7 +1470,8 @@ def process_emails(force: bool = False, dry_run: bool = False):
             transactions or marking emails as processed.
     """
     # Validate all required config is present
-    missing = [k for k, v in CONFIG.items() if not v]
+    OPTIONAL_CONFIG = {"ynab_amazon_account_id"}
+    missing = [k for k, v in CONFIG.items() if not v and k not in OPTIONAL_CONFIG]
     if missing:
         print(f"Error: Missing configuration: {', '.join(missing)}")
         print("Copy .env.example to .env and fill in your credentials.")
