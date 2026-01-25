@@ -1113,7 +1113,7 @@ def create_ynab_transaction(
     memo: str | None,
     import_id: str,
     is_inflow: bool = False,
-) -> tuple[str, bool]:
+) -> tuple[str | None, bool]:
     """Create a transaction in YNAB.
 
     Creates an unapproved, uncleared transaction that will appear in
@@ -1597,8 +1597,10 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
 
             # Match merchant name to existing YNAB payee for consistent naming
             final_payee = (
-                match_payee_name(result.merchant, payee_names) or result.merchant or "Unknown"
-            )
+                match_payee_name(result.merchant, payee_names)
+                if result.merchant
+                else None
+            ) or result.merchant or "Unknown"
             if final_payee != result.merchant and result.merchant:
                 print(f"    -> Matched payee: '{result.merchant}' -> '{final_payee}'")
 
@@ -1691,6 +1693,7 @@ def process_emails(force: bool = False, refresh_payees: bool = False, dry_run: b
                 errors += len(batch)
 
         # Complete the run
+        assert run_id is not None
         complete_run(run_id, receipts_added)
 
     # Print transaction summary table (for both dry run and live runs)
@@ -1773,7 +1776,7 @@ def undo_last_run():
     not_found = 0
     errors = 0
 
-    for _email_id, ynab_id in transactions:
+    for _, ynab_id in transactions:
         if not ynab_id:
             not_found += 1
             continue

@@ -1,0 +1,5 @@
+{
+  "include": ["fastmail2ynab.py"],
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none"
+}

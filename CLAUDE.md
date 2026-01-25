@@ -56,6 +56,12 @@ To format:
 uvx ruff format fastmail2ynab.py
 ```
 
+To type-check:
+
+```bash
+uvx pyright fastmail2ynab.py
+```
+
 To test the CLI:
 
 ```bash
