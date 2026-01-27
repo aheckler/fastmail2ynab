@@ -173,8 +173,8 @@ Delete this file to start fresh and reprocess all emails.
 
 When classifying emails, Claude matches the extracted merchant name to your existing YNAB payees. This handles:
 
-- **Abbreviations**: "Willow Creek Homeowners Association" → "Willow Creek HOA"
-- **Suffixes**: "Anthropic PC" → "Anthropic" (ignores Inc, LLC, PC, etc.)
+- **Abbreviations**: "Example Homeowners Association" → "Example HOA"
+- **Suffixes**: "Anthropic PBC" → "Anthropic" (ignores Inc, LLC, PBC, etc.)
 - **Common variations**: Different capitalizations, punctuation, etc.
 
 This ensures transactions use your existing payee names for consistent categorization and reporting.
