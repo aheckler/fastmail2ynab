@@ -4,6 +4,9 @@
 # Local database (contains user data)
 processed_emails.db
 
+# Lock file (prevents concurrent execution)
+.fastmail2ynab.lock
+
 # Python bytecode cache
 __pycache__/
 *.pyc

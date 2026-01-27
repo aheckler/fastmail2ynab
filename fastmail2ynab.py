@@ -60,6 +60,7 @@ Environment Variables (in .env file):
 
 # Standard library
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -67,6 +68,7 @@ import re
 import sqlite3
 import traceback
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
@@ -123,6 +125,34 @@ CONFIG = {
 # Database path - stored alongside the script for easy backup/inspection
 # Contains: processed_emails (tracking) and classification_cache (AI results)
 DB_PATH = Path(__file__).parent / "processed_emails.db"
+
+# Lock file path - used to prevent concurrent execution
+LOCK_PATH = Path(__file__).parent / ".fastmail2ynab.lock"
+
+
+@contextmanager
+def acquire_lock():
+    """Acquire exclusive lock to prevent concurrent execution.
+
+    Uses OS-level file locking (fcntl.flock) to ensure only one instance
+    of the script runs at a time. The lock is automatically released when
+    the context manager exits.
+
+    Raises:
+        SystemExit: If another instance is already running.
+    """
+    lock_file = open(LOCK_PATH, "w")  # noqa: SIM115
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        raise SystemExit("Another instance is already running. Exiting.") from None
+    try:
+        yield
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
 
 # API endpoint URLs
 FASTMAIL_JMAP_URL = "https://api.fastmail.com/jmap/session"  # JMAP session endpoint
@@ -992,10 +1022,10 @@ def classify_email(
     # Truncate body to avoid token limits (8000 chars ≈ 2000 tokens)
     truncated_body = email.body[:8000]
 
-    # Format payee list for the prompt (limit to avoid token bloat)
-    # Sort alphabetically for easier scanning by Claude
+    # Format payee list for the prompt
+    # Limit to 2000 payees to stay within reasonable token limits
     sorted_payees = sorted(payee_names)
-    payee_list = "\n".join(sorted_payees[:500])  # Cap at 500 payees
+    payee_list = "\n".join(sorted_payees[:2000])
 
     # Structured prompt asking for JSON output
     # Includes scoring rubric and field definitions
@@ -1115,12 +1145,13 @@ def generate_import_id(email_id: str, amount: float, date: str, force: bool = Fa
     create a transaction with an import_id that already exists, YNAB
     returns 409 Conflict.
 
-    The import_id format is: YNAB:{amount_milliunits}:{date}:{hash}
-    This incorporates the email ID to ensure uniqueness.
+    The import_id format is: YNAB:{date}:{hash16}
+    The 16-char hash provides 64 bits of entropy, reducing collision risk
+    at scale (collision probability ~0.00001% at 65K transactions).
 
     Args:
         email_id: Fastmail's unique email identifier.
-        amount: Transaction amount (used in the ID for clarity).
+        amount: Transaction amount (unused but kept for API compatibility).
         date: Transaction date in YYYY-MM-DD format.
         force: If True, adds a timestamp to bypass deduplication.
             Use this to reimport transactions that were deleted from YNAB.
@@ -1128,13 +1159,13 @@ def generate_import_id(email_id: str, amount: float, date: str, force: bool = Fa
     Returns:
         Import ID string, max 36 characters (YNAB limit).
     """
+    del amount  # Unused, kept for backwards compatibility
     hash_input = email_id.encode()
     if force:
         # Add timestamp to make the ID unique even for the same email
         hash_input += datetime.now(UTC).isoformat().encode()
-    hash_hex = hashlib.md5(hash_input).hexdigest()[:8]
-    amount_milliunits = abs(int(amount * 1000))
-    import_id = f"YNAB:{amount_milliunits}:{date}:{hash_hex}"
+    hash_hex = hashlib.md5(hash_input).hexdigest()[:16]
+    import_id = f"YNAB:{date}:{hash_hex}"
     return import_id[:36]  # YNAB limit
 
 
@@ -1539,6 +1570,13 @@ def process_emails(force: bool = False, dry_run: bool = False, confirm: bool = F
         print("Copy .env.example to .env and fill in your credentials.")
         return
 
+    # Acquire exclusive lock to prevent concurrent execution
+    with acquire_lock():
+        _process_emails_impl(force=force, dry_run=dry_run, confirm=confirm)
+
+
+def _process_emails_impl(force: bool, dry_run: bool, confirm: bool):
+    """Internal implementation of process_emails (called with lock held)."""
     if dry_run:
         print("*** DRY RUN MODE: No transactions will be created ***")
         print()
@@ -1814,6 +1852,13 @@ def undo_last_run():
         print("Error: Missing YNAB configuration")
         return
 
+    # Acquire exclusive lock to prevent concurrent execution
+    with acquire_lock():
+        _undo_last_run_impl()
+
+
+def _undo_last_run_impl():
+    """Internal implementation of undo_last_run (called with lock held)."""
     init_db()
 
     last_run = get_last_run()
