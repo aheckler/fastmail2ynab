@@ -384,6 +384,12 @@ def init_db():
             )
         """)
 
+        # Add matched_payee column if it doesn't exist (migration for existing databases)
+        cursor.execute("PRAGMA table_info(classification_cache)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "matched_payee" not in columns:
+            cursor.execute("ALTER TABLE classification_cache ADD COLUMN matched_payee TEXT")
+
         # Table 3: Cache YNAB payees for name matching
         # Reduces API calls by caching payee list with delta updates
         cursor.execute("""
