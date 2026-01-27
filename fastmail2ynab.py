@@ -113,7 +113,9 @@ CONFIG = {
     # YNAB target location
     "ynab_budget_id": os.getenv("YNAB_BUDGET_ID"),  # Budget to add transactions to
     "ynab_account_id": os.getenv("YNAB_ACCOUNT_ID"),  # Account (e.g., credit card)
-    "ynab_amazon_account_id": os.getenv("YNAB_AMAZON_ACCOUNT_ID"),  # Optional: separate Amazon account
+    "ynab_amazon_account_id": os.getenv(
+        "YNAB_AMAZON_ACCOUNT_ID"
+    ),  # Optional: separate Amazon account
     # Processing settings
     "min_score": safe_int(os.getenv("MIN_SCORE"), 6),  # Min AI score (1-10) to import
 }
@@ -1698,12 +1700,24 @@ def process_emails(force: bool = False, dry_run: bool = False, confirm: bool = F
     # Interactive selection if --confirm flag is set
     if confirm and pending_transactions:
         print()
+        original_pending = pending_transactions.copy()
         pending_transactions = select_transactions_interactive(
             pending_transactions, transaction_display_data
         )
+
+        # Mark skipped transactions as processed so they don't appear again
+        if not dry_run:
+            selected_ids = {txn.email_id for txn in pending_transactions}
+            skipped_count = 0
+            for txn in original_pending:
+                if txn.email_id not in selected_ids:
+                    mark_processed(txn.email_id, is_receipt=True, ynab_id=None, run_id=run_id)
+                    skipped_count += 1
+            if skipped_count:
+                print(f"Marked {skipped_count} skipped transaction(s) as processed.")
+
         if not pending_transactions:
             print("No transactions selected. Exiting.")
-            # Still mark non-receipts as processed (already done above)
             return
 
     # Batch create transactions in YNAB (not in dry run mode)
