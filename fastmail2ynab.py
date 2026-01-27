@@ -5,6 +5,7 @@
 #     "requests>=2.31.0",
 #     "python-dotenv>=1.0.0",
 #     "anthropic>=0.18.0",
+#     "questionary>=2.0.0",
 # ]
 # ///
 """
@@ -30,6 +31,9 @@ Usage:
 
     # Preview what would be imported without creating transactions
     uv run fastmail2ynab.py --dry-run
+
+    # Interactively select which transactions to create
+    uv run fastmail2ynab.py --confirm
 
     # Force reimport (reprocess all emails, bypass YNAB duplicate detection)
     uv run fastmail2ynab.py --force
@@ -70,6 +74,7 @@ from pathlib import Path
 
 # Third-party
 import anthropic
+import questionary
 import requests
 from dotenv import load_dotenv
 
@@ -1453,7 +1458,53 @@ def refresh_payee_cache_if_needed(token: str, budget_id: str) -> list[str]:
 # =============================================================================
 
 
-def process_emails(force: bool = False, dry_run: bool = False):
+def select_transactions_interactive(
+    pending: list[PendingTransaction],
+    display_data: dict[str, tuple[str, str, float, bool, int]],
+) -> list[PendingTransaction]:
+    """Show interactive checkbox selection for pending transactions.
+
+    Args:
+        pending: List of pending transactions to select from.
+        display_data: Dict mapping email_id to (date, payee, amount, is_inflow, score).
+
+    Returns:
+        List of selected transactions. Empty list if user cancelled.
+    """
+    if not pending:
+        return pending
+
+    # Override questionary's indicators to use clearer checkbox markers
+    # Must patch in common module where they're actually used, not just constants
+    from questionary.prompts import common
+
+    common.INDICATOR_SELECTED = "[X]"
+    common.INDICATOR_UNSELECTED = "[ ]"
+
+    # Build choices with transaction details
+    choices = []
+    for txn in pending:
+        date, payee, amount, is_inflow, score = display_data[txn.email_id]
+        sign = "+" if is_inflow else "-"
+        label = f"{date} | {payee[:30]:<30} | {sign}${amount:.2f} (score: {score})"
+        choices.append(questionary.Choice(title=label, value=txn.email_id, checked=True))
+
+    # Show checkbox selection
+    print("[X] = import, [ ] = skip")
+    print()
+    selected_ids = questionary.checkbox(
+        "Select transactions to import:",
+        choices=choices,
+        instruction="(space: toggle, a: all, enter: confirm)",
+    ).ask()
+
+    if selected_ids is None:  # User cancelled (Ctrl+C)
+        return []
+
+    return [txn for txn in pending if txn.email_id in selected_ids]
+
+
+def process_emails(force: bool = False, dry_run: bool = False, confirm: bool = False):
     """Main entry point: fetch emails, classify, and create YNAB transactions.
 
     Processing flow for each email:
@@ -1465,8 +1516,9 @@ def process_emails(force: bool = False, dry_run: bool = False):
     6. Use transaction date from email, or fall back to email received date
     7. Match merchant to existing YNAB payee for consistent naming
     8. Collect pending transactions for batch creation
-    9. Create transactions in YNAB (in batches of 5)
-    10. Mark emails as processed in our database
+    9. (Optional) Show interactive selection if --confirm flag is set
+    10. Create transactions in YNAB (in batches of 5)
+    11. Mark emails as processed in our database
 
     Args:
         force: If True, reprocess all emails even if already in processed_emails,
@@ -1474,6 +1526,8 @@ def process_emails(force: bool = False, dry_run: bool = False):
             transactions that were previously deleted from YNAB.
         dry_run: If True, show what would be created without actually creating
             transactions or marking emails as processed.
+        confirm: If True, show interactive checkbox selection before creating
+            transactions in YNAB.
     """
     # Validate all required config is present
     OPTIONAL_CONFIG = {"ynab_amazon_account_id"}
@@ -1640,6 +1694,17 @@ def process_emails(force: bool = False, dry_run: bool = False):
     if not dry_run:
         for email_id in non_receipt_emails:
             mark_processed(email_id, is_receipt=False, run_id=run_id)
+
+    # Interactive selection if --confirm flag is set
+    if confirm and pending_transactions:
+        print()
+        pending_transactions = select_transactions_interactive(
+            pending_transactions, transaction_display_data
+        )
+        if not pending_transactions:
+            print("No transactions selected. Exiting.")
+            # Still mark non-receipts as processed (already done above)
+            return
 
     # Batch create transactions in YNAB (not in dry run mode)
     if not dry_run and pending_transactions:
@@ -1830,6 +1895,14 @@ if __name__ == "__main__":
             "and removing the processed email records."
         ),
     )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help=(
+            "Interactively select which transactions to create. "
+            "Shows a checkbox list before sending to YNAB."
+        ),
+    )
     args = parser.parse_args()
 
     # Handle --undo: undo the last run and exit
@@ -1841,6 +1914,8 @@ if __name__ == "__main__":
             other_flags.append("--clear-cache")
         if args.dry_run:
             other_flags.append("--dry-run")
+        if args.confirm:
+            other_flags.append("--confirm")
         if other_flags:
             print(f"Warning: {', '.join(other_flags)} ignored when using --undo")
             print()
@@ -1856,4 +1931,4 @@ if __name__ == "__main__":
         print("Cache cleared.")
         print()
 
-    process_emails(force=args.force, dry_run=args.dry_run)
+    process_emails(force=args.force, dry_run=args.dry_run, confirm=args.confirm)

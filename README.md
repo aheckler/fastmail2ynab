@@ -57,6 +57,7 @@ Dependencies are declared inline in the script using PEP 723, so uv handles them
 | `--force` | Reprocess all emails and bypass YNAB's duplicate detection. Use to reimport transactions deleted from YNAB. |
 | `--clear-cache` | Clear Claude's classification cache and re-analyze all emails. Useful if you've updated scoring criteria. |
 | `--undo` | Undo the most recent run by deleting its transactions from YNAB and removing processed email records. |
+| `--confirm` | Interactively select which transactions to create. Shows a checkbox list before sending to YNAB. |
 
 Examples:
 
@@ -66,6 +67,9 @@ uv run fastmail2ynab.py
 
 # Preview what would be imported (classifications are cached for later)
 uv run fastmail2ynab.py --dry-run
+
+# Interactively select which transactions to create
+uv run fastmail2ynab.py --confirm
 
 # Reimport transactions deleted from YNAB
 uv run fastmail2ynab.py --force
