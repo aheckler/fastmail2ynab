@@ -38,29 +38,10 @@ Flags can be combined: `uv run fastmail2ynab.py --force --clear-cache`
 
 ## Verification
 
-After making code changes, run the linter:
-
-```bash
-uvx ruff check fastmail2ynab.py
-```
-
-To auto-fix issues:
-
-```bash
-uvx ruff check --fix fastmail2ynab.py
-```
-
-To format:
-
-```bash
-uvx ruff format fastmail2ynab.py
-```
-
-To type-check:
-
-```bash
-uvx pyright fastmail2ynab.py
-```
+Verification runs automatically via a PostToolUse hook after editing Python files. The hook:
+- Auto-fixes linting issues (`ruff check --fix`)
+- Auto-formats code (`ruff format`)
+- Type-checks (`pyright`)
 
 To test the CLI:
 
