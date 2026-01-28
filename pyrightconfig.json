@@ -1,5 +1,8 @@
 {
   "include": ["fastmail2ynab.py"],
+  "typeCheckingMode": "standard",
   "reportMissingImports": "none",
-  "reportMissingModuleSource": "none"
+  "reportMissingModuleSource": "none",
+  "reportUnusedVariable": "warning",
+  "reportUnusedImport": "warning"
 }

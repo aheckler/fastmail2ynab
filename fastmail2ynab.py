@@ -139,7 +139,7 @@ def acquire_lock():
     Raises:
         SystemExit: If another instance is already running.
     """
-    lock_file = open(LOCK_PATH, "w")  # noqa: SIM115
+    lock_file = LOCK_PATH.open("w")
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -259,13 +259,13 @@ def validate_transaction_date(date_str: str | None, email_received_at: str) -> s
 
     Returns a valid YYYY-MM-DD date string, or None if unrecoverable.
     """
-    today = datetime.now().date()
+    today = datetime.now(UTC).date()
     five_years_ago = today - timedelta(days=5 * 365)
 
     # Try the extracted date first
     if date_str:
         try:
-            parsed = datetime.strptime(date_str, "%Y-%m-%d").date()
+            parsed = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC).date()
             if five_years_ago <= parsed <= today:
                 return date_str  # Valid date
         except ValueError:
@@ -275,7 +275,7 @@ def validate_transaction_date(date_str: str | None, email_received_at: str) -> s
     try:
         received_dt = datetime.fromisoformat(email_received_at.replace("Z", "+00:00"))
         fallback = received_dt.strftime("%Y-%m-%d")
-        parsed = datetime.strptime(fallback, "%Y-%m-%d").date()
+        parsed = datetime.strptime(fallback, "%Y-%m-%d").replace(tzinfo=UTC).date()
         if five_years_ago <= parsed <= today:
             return fallback
     except (ValueError, AttributeError):
@@ -1162,7 +1162,7 @@ def generate_import_id(email_id: str, amount: float, date: str, force: bool = Fa
     if force:
         # Add timestamp to make the ID unique even for the same email
         hash_input += datetime.now(UTC).isoformat().encode()
-    hash_hex = hashlib.md5(hash_input).hexdigest()[:16]
+    hash_hex = hashlib.md5(hash_input, usedforsecurity=False).hexdigest()[:16]
     import_id = f"YNAB:{date}:{hash_hex}"
     return import_id[:36]  # YNAB limit
 
@@ -1203,7 +1203,7 @@ def create_ynab_transaction(
     """
     # Convert to YNAB milliunits: $29.99 = 29990
     # Positive = inflow (deposits, refunds), Negative = outflow (purchases)
-    milliunits = int(round(amount * 1000))
+    milliunits = round(amount * 1000)
     if not is_inflow:
         milliunits = -milliunits
 
@@ -1265,7 +1265,7 @@ def create_ynab_transactions_batch(
     # Build the transactions payload
     transactions = []
     for pt in pending_transactions:
-        milliunits = int(round(pt.amount * 1000))
+        milliunits = round(pt.amount * 1000)
         if not pt.is_inflow:
             milliunits = -milliunits
 

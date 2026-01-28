@@ -10,7 +10,19 @@ select = [
     "UP",     # pyupgrade
     "B",      # flake8-bugbear
     "SIM",    # flake8-simplify
+    "C4",     # flake8-comprehensions
+    "DTZ",    # flake8-datetimez
+    "PIE",    # flake8-pie
+    "RET",    # flake8-return
+    "PTH",    # flake8-use-pathlib
+    "PERF",   # perflint
+    "LOG",    # flake8-logging
+    "RUF",    # ruff-specific rules
+    "S",      # flake8-bandit (security)
+    "T20",    # flake8-print
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
+    "T201",   # print statements (intentional in CLI)
+    "S101",   # assert usage (fine for this script)
 ]
