@@ -1687,7 +1687,7 @@ def _process_emails_impl(force: bool, confirm: bool):
             import_id = generate_import_id(email.id, result.amount, transaction_date, force=force)
 
             # Build memo with metadata for reference in YNAB
-            memo = f"fm2ynab | Score: {result.score}/10"
+            memo = f"fm2ynab | Run: {run_id[:8]}"
 
             # Store display data for summary table
             transaction_display_data[email.id] = (
