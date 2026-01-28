@@ -29,10 +29,8 @@ Usage:
     # Normal run - process recent emails
     uv run fastmail2ynab.py
 
-    # Preview what would be imported without creating transactions
-    uv run fastmail2ynab.py --dry-run
-
     # Interactively select which transactions to create
+    # Cancel (Ctrl+C) to preview without marking emails as processed
     uv run fastmail2ynab.py --confirm
 
     # Force reimport (reprocess all emails, bypass YNAB duplicate detection)
@@ -1494,7 +1492,7 @@ def refresh_payee_cache_if_needed(token: str, budget_id: str) -> list[str]:
 def select_transactions_interactive(
     pending: list[PendingTransaction],
     display_data: dict[str, tuple[str, str, float, bool, int]],
-) -> list[PendingTransaction]:
+) -> list[PendingTransaction] | None:
     """Show interactive checkbox selection for pending transactions.
 
     Args:
@@ -1502,7 +1500,8 @@ def select_transactions_interactive(
         display_data: Dict mapping email_id to (date, payee, amount, is_inflow, score).
 
     Returns:
-        List of selected transactions. Empty list if user cancelled.
+        List of selected transactions if user confirmed (may be empty).
+        None if user cancelled with Ctrl+C.
     """
     if not pending:
         return pending
@@ -1532,12 +1531,12 @@ def select_transactions_interactive(
     ).ask()
 
     if selected_ids is None:  # User cancelled (Ctrl+C)
-        return []
+        return None
 
     return [txn for txn in pending if txn.email_id in selected_ids]
 
 
-def process_emails(force: bool = False, dry_run: bool = False, confirm: bool = False):
+def process_emails(force: bool = False, confirm: bool = False):
     """Main entry point: fetch emails, classify, and create YNAB transactions.
 
     Processing flow for each email:
@@ -1557,10 +1556,9 @@ def process_emails(force: bool = False, dry_run: bool = False, confirm: bool = F
         force: If True, reprocess all emails even if already in processed_emails,
             and bypass YNAB's import_id deduplication. Use this to reimport
             transactions that were previously deleted from YNAB.
-        dry_run: If True, show what would be created without actually creating
-            transactions or marking emails as processed.
         confirm: If True, show interactive checkbox selection before creating
-            transactions in YNAB.
+            transactions in YNAB. Cancel (Ctrl+C) to preview without marking
+            emails as processed.
     """
     # Validate all required config is present
     OPTIONAL_CONFIG = {"ynab_amazon_account_id"}
@@ -1572,23 +1570,20 @@ def process_emails(force: bool = False, dry_run: bool = False, confirm: bool = F
 
     # Acquire exclusive lock to prevent concurrent execution
     with acquire_lock():
-        _process_emails_impl(force=force, dry_run=dry_run, confirm=confirm)
+        _process_emails_impl(force=force, confirm=confirm)
 
 
-def _process_emails_impl(force: bool, dry_run: bool, confirm: bool):
+def _process_emails_impl(force: bool, confirm: bool):
     """Internal implementation of process_emails (called with lock held)."""
-    if dry_run:
-        print("*** DRY RUN MODE: No transactions will be created ***")
-        print()
-    elif force:
+    if force:
         print("*** FORCE MODE: Will bypass YNAB duplicate detection ***")
         print()
 
     # Initialize database tables
     init_db()
 
-    # Start a new run (unless dry run)
-    run_id = None if dry_run else start_run()
+    # Start a new run
+    run_id = start_run()
 
     # Refresh YNAB payee cache for matching merchant names
     payee_names = refresh_payee_cache_if_needed(
@@ -1649,15 +1644,13 @@ def _process_emails_impl(force: bool, dry_run: bool, confirm: bool):
             # Skip if below confidence threshold
             if result.score < CONFIG["min_score"]:
                 print(f"    -> Below threshold ({CONFIG['min_score']}), skipping")
-                if not dry_run:
-                    non_receipt_emails.append(email.id)
+                non_receipt_emails.append(email.id)
                 continue
 
             # Skip if Claude couldn't extract an amount
             if result.amount is None:
                 print("    -> Missing amount, skipping")
-                if not dry_run:
-                    non_receipt_emails.append(email.id)
+                non_receipt_emails.append(email.id)
                 continue
 
             # Determine transaction date
@@ -1666,8 +1659,7 @@ def _process_emails_impl(force: bool, dry_run: bool, confirm: bool):
             transaction_date = validate_transaction_date(result.date, email.received_at)
             if not transaction_date:
                 print("    -> Invalid date and could not recover, skipping")
-                if not dry_run:
-                    non_receipt_emails.append(email.id)
+                non_receipt_emails.append(email.id)
                 continue
 
             if transaction_date != result.date:
@@ -1706,60 +1698,62 @@ def _process_emails_impl(force: bool, dry_run: bool, confirm: bool):
                 result.score,
             )
 
-            if dry_run:
-                print(f"    -> [DRY RUN] Would create: {final_payee} {sign}${result.amount:.2f}")
-                created_email_ids.append(email.id)
-                receipts_added += 1
-            else:
-                # Add to pending transactions for batch creation
-                pending_transactions.append(
-                    PendingTransaction(
-                        email_id=email.id,
-                        account_id=account_id,
-                        amount=result.amount,
-                        date=transaction_date,
-                        payee_name=final_payee[:50],
-                        memo=memo,
-                        import_id=import_id,
-                        is_inflow=result.is_inflow,
-                    )
+            # Add to pending transactions for batch creation
+            pending_transactions.append(
+                PendingTransaction(
+                    email_id=email.id,
+                    account_id=account_id,
+                    amount=result.amount,
+                    date=transaction_date,
+                    payee_name=final_payee[:50],
+                    memo=memo,
+                    import_id=import_id,
+                    is_inflow=result.is_inflow,
                 )
+            )
 
         except Exception as e:
             print(f"    -> Error: {e}")
             print(f"    -> {traceback.format_exc()}")
             errors += 1
 
-    # Mark non-receipt emails as processed (not in dry run mode)
-    if not dry_run:
-        for email_id in non_receipt_emails:
-            mark_processed(email_id, is_receipt=False, run_id=run_id)
-
     # Interactive selection if --confirm flag is set
     if confirm and pending_transactions:
         print()
         original_pending = pending_transactions.copy()
-        pending_transactions = select_transactions_interactive(
-            pending_transactions, transaction_display_data
-        )
+        result = select_transactions_interactive(pending_transactions, transaction_display_data)
 
-        # Mark skipped transactions as processed so they don't appear again
-        if not dry_run:
-            selected_ids = {txn.email_id for txn in pending_transactions}
-            skipped_count = 0
-            for txn in original_pending:
-                if txn.email_id not in selected_ids:
-                    mark_processed(txn.email_id, is_receipt=True, ynab_id=None, run_id=run_id)
-                    skipped_count += 1
-            if skipped_count:
-                print(f"Marked {skipped_count} skipped transaction(s) as processed.")
-
-        if not pending_transactions:
-            print("No transactions selected. Exiting.")
+        if result is None:
+            # User cancelled with Ctrl+C - don't mark anything as processed (preview mode)
+            print("Cancelled. No emails marked as processed.")
             return
 
-    # Batch create transactions in YNAB (not in dry run mode)
-    if not dry_run and pending_transactions:
+        pending_transactions = result
+
+        # Mark non-receipt emails as processed (user confirmed)
+        for email_id in non_receipt_emails:
+            mark_processed(email_id, is_receipt=False, run_id=run_id)
+
+        # Mark skipped transactions as processed (user explicitly confirmed)
+        selected_ids = {txn.email_id for txn in pending_transactions}
+        skipped_count = 0
+        for txn in original_pending:
+            if txn.email_id not in selected_ids:
+                mark_processed(txn.email_id, is_receipt=True, ynab_id=None, run_id=run_id)
+                skipped_count += 1
+        if skipped_count:
+            print(f"Marked {skipped_count} skipped transaction(s) as processed.")
+
+        if not pending_transactions:
+            print("No transactions selected. Marked skipped emails as processed.")
+            return
+    else:
+        # No --confirm or no pending transactions - mark non-receipts as processed
+        for email_id in non_receipt_emails:
+            mark_processed(email_id, is_receipt=False, run_id=run_id)
+
+    # Batch create transactions in YNAB
+    if pending_transactions:
         print()
         print(f"Creating {len(pending_transactions)} transactions in YNAB...")
 
@@ -1793,10 +1787,12 @@ def _process_emails_impl(force: bool, dry_run: bool, confirm: bool):
                 errors += len(batch)
 
         # Complete the run
-        assert run_id is not None
         complete_run(run_id, receipts_added)
+    else:
+        # No transactions to create, but still complete the run
+        complete_run(run_id, 0)
 
-    # Print transaction summary table (for both dry run and live runs)
+    # Print transaction summary table
     if created_email_ids:
         # Build list of transactions to display
         display_transactions = [
@@ -1807,10 +1803,7 @@ def _process_emails_impl(force: bool, dry_run: bool, confirm: bool):
 
         if display_transactions:
             print()
-            if dry_run:
-                print("Transactions that would be created:")
-            else:
-                print("Transactions created:")
+            print("Transactions created:")
 
             # Calculate column widths
             max_payee_len = max(len(payee) for _, payee, _, _, _ in display_transactions)
@@ -1828,14 +1821,9 @@ def _process_emails_impl(force: bool, dry_run: bool, confirm: bool):
 
     # Print summary statistics
     print()
-    if dry_run:
-        print(
-            f"Dry run complete! {receipts_added} would be created, {skipped} skipped, {cached} from cache, {errors} errors"
-        )
-    else:
-        print(
-            f"Done! {receipts_added} added, {duplicates} already in YNAB, {skipped} skipped, {cached} from cache, {errors} errors"
-        )
+    print(
+        f"Done! {receipts_added} added, {duplicates} already in YNAB, {skipped} skipped, {cached} from cache, {errors} errors"
+    )
 
 
 def undo_last_run():
@@ -1939,14 +1927,6 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "Preview what transactions would be created without actually "
-            "creating them in YNAB or marking emails as processed."
-        ),
-    )
-    parser.add_argument(
         "--undo",
         action="store_true",
         help=(
@@ -1959,7 +1939,7 @@ if __name__ == "__main__":
         action="store_true",
         help=(
             "Interactively select which transactions to create. "
-            "Shows a checkbox list before sending to YNAB."
+            "Cancel (Ctrl+C) to preview without marking emails as processed."
         ),
     )
     args = parser.parse_args()
@@ -1971,8 +1951,6 @@ if __name__ == "__main__":
             other_flags.append("--force")
         if args.clear_cache:
             other_flags.append("--clear-cache")
-        if args.dry_run:
-            other_flags.append("--dry-run")
         if args.confirm:
             other_flags.append("--confirm")
         if other_flags:
@@ -1990,4 +1968,4 @@ if __name__ == "__main__":
         print("Cache cleared.")
         print()
 
-    process_emails(force=args.force, dry_run=args.dry_run, confirm=args.confirm)
+    process_emails(force=args.force, confirm=args.confirm)

@@ -53,11 +53,10 @@ Dependencies are declared inline in the script using PEP 723, so uv handles them
 
 | Flag | Description |
 |------|-------------|
-| `--dry-run` | Preview what transactions would be created without actually creating them or marking emails as processed. |
 | `--force` | Reprocess all emails and bypass YNAB's duplicate detection. Use to reimport transactions deleted from YNAB. |
 | `--clear-cache` | Clear Claude's classification cache and re-analyze all emails. Useful if you've updated scoring criteria. |
 | `--undo` | Undo the most recent run by deleting its transactions from YNAB and removing processed email records. |
-| `--confirm` | Interactively select which transactions to create. Shows a checkbox list before sending to YNAB. |
+| `--confirm` | Interactively select which transactions to create. Cancel (Ctrl+C) to preview without marking emails as processed. |
 
 Examples:
 
@@ -65,10 +64,8 @@ Examples:
 # Normal run
 uv run fastmail2ynab.py
 
-# Preview what would be imported (classifications are cached for later)
-uv run fastmail2ynab.py --dry-run
-
 # Interactively select which transactions to create
+# Use Ctrl+C to cancel and preview without marking emails as processed
 uv run fastmail2ynab.py --confirm
 
 # Reimport transactions deleted from YNAB
@@ -223,5 +220,6 @@ If not configured, Amazon transactions go to the default account like everything
 - This also removes the processed email records so they can be reprocessed
 
 **Want to preview before importing**
-- Use `--dry-run` to see what would be imported
+- Use `--confirm` and press Ctrl+C during selection to preview
 - Classifications are cached, so the real run won't re-call Claude
+- Emails won't be marked as processed, so they'll reappear on the next run

@@ -28,11 +28,10 @@ Dependencies are declared inline using PEP 723 script metadata, so uv handles th
 
 | Flag | Description |
 |------|-------------|
-| `--dry-run` | Preview what transactions would be created without actually creating them or marking emails as processed. |
 | `--force` | Reprocess all emails and bypass YNAB's duplicate detection. Use to reimport transactions deleted from YNAB. |
 | `--clear-cache` | Clear Claude's classification cache before running. Forces re-analysis of all emails. Useful after prompt changes. |
 | `--undo` | Undo the most recent run by deleting its transactions from YNAB and removing processed email records. |
-| `--confirm` | Interactively select which transactions to create. Shows a checkbox list before sending to YNAB. |
+| `--confirm` | Interactively select which transactions to create. Cancel (Ctrl+C) to preview without marking emails as processed. |
 
 Flags can be combined: `uv run fastmail2ynab.py --force --clear-cache`
 
