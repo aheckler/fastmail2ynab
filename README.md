@@ -49,9 +49,9 @@ Edit the `YNAB_ACCOUNTS` setting in `.env`:
 
 ```json
 [
-  {"name": "Chase Freedom", "ynab_id": "abc-123-your-account-id", "default": true},
-  {"name": "Apple Card", "ynab_id": "def-456-your-account-id"},
-  {"name": "SoFi Checking", "ynab_id": "ghi-789-your-account-id"}
+  {"name": "Example Card", "ynab_id": "abc-123-your-account-id", "default": true},
+  {"name": "Another Card", "ynab_id": "def-456-your-account-id"},
+  {"name": "Bank Checking", "ynab_id": "ghi-789-your-account-id"}
 ]
 ```
 
@@ -64,15 +64,14 @@ Edit the `YNAB_ACCOUNTS` setting in `.env`:
 Edit `.env.notes` to describe each account:
 
 ```
-Chase Freedom:
-Primary credit card. Default for unknown transactions. Most merchant receipts go here.
+Example Card:
+Primary credit card. Default for unknown transactions. Most merchant receipts go here. Used for everyday purchases, dining, etc.
 
-Apple Card:
-Goldman Sachs Apple Card. Emails from @apple.com with "Apple Card Transaction".
-Used for Apple subscriptions and App Store purchases.
+Another Card:
+Used for most travel-related expenses, e.g. hotels, airfare, tourism, and so on.
 
-SoFi Checking:
-Main checking account. Emails from @sofi.com mentioning "checking" or "direct deposit".
+Bank Checking:
+Main checking account. Used for mobile check deposits, direct deposits, Zelle transfers. Venmo and PayPal transfers often land here.
 ```
 
 These descriptions help Claude route transactions to the correct account.
