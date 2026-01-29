@@ -1279,11 +1279,11 @@ ACCOUNTS (for routing):
 
 ---
 
-Score this email from 1-10 on how confident you are that it represents a financial transaction:
-- 1-3: Clearly not a transaction (newsletters, marketing, shipping updates without prices)
-- 4-5: Unlikely but has some financial language
-- 6-7: Probably a transaction but missing some details
-- 8-10: Clearly a financial transaction with amount and merchant/source
+Score this email from 1-10 on how confident you are that money HAS MOVED or IS SCHEDULED TO MOVE:
+- 1-3: Not financial (newsletters, marketing, shipping updates without prices)
+- 4-5: Financially related but no transaction occurred (expiration notices, renewal reminders, price change notices, payment method alerts)
+- 6-7: Probably a transaction but missing key details
+- 8-10: Confirmed transaction - receipt, charge confirmation, payment confirmation, or autopay bill with specific due date
 
 Also determine if this is:
 - OUTFLOW: Money I spent (purchases, subscriptions, bills, fees, charges)
