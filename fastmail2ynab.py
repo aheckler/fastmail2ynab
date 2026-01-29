@@ -47,9 +47,12 @@ Environment Variables (in .env file):
     ANTHROPIC_API_KEY      - Claude API key
     YNAB_TOKEN             - YNAB personal access token
     YNAB_BUDGET_ID         - Target budget UUID
-    YNAB_ACCOUNT_ID        - Target account UUID (e.g., credit card)
-    YNAB_AMAZON_ACCOUNT_ID - Optional: separate account for Amazon transactions
+    YNAB_ACCOUNTS          - JSON array of account configurations (see .env.example)
     MIN_SCORE              - Minimum AI confidence to import (default: 6)
+
+Account Descriptions (in .env.notes file):
+    Detailed descriptions for each account to help AI route transactions.
+    See .env.notes.example for format.
 """
 
 # =============================================================================
@@ -104,21 +107,156 @@ def safe_int(value: str | None, default: int) -> int:
 # Load environment variables from .env file
 load_dotenv()
 
+
+def parse_env_notes(script_dir: Path) -> dict[str, str]:
+    """Parse .env.notes file to get account descriptions.
+
+    The format is:
+        Account Name:
+        Notes about this account on following lines
+        until the next account name (line ending with colon).
+
+    Args:
+        script_dir: Directory containing .env.notes file.
+
+    Returns:
+        Dict mapping account name to notes string.
+    """
+    notes_path = script_dir / ".env.notes"
+    if not notes_path.exists():
+        return {}
+
+    notes: dict[str, str] = {}
+    current_account: str | None = None
+    current_lines: list[str] = []
+
+    try:
+        content = notes_path.read_text()
+    except Exception:
+        return {}
+
+    for line in content.splitlines():
+        # Check if this line is an account header (ends with colon, no leading whitespace)
+        if line.rstrip().endswith(":") and not line.startswith((" ", "\t")):
+            # Save previous account if any
+            if current_account is not None:
+                notes[current_account] = "\n".join(current_lines).strip()
+            # Start new account
+            current_account = line.rstrip(":").strip()
+            current_lines = []
+        elif current_account is not None:
+            current_lines.append(line)
+
+    # Save last account
+    if current_account is not None:
+        notes[current_account] = "\n".join(current_lines).strip()
+
+    return notes
+
+
+def load_accounts(script_dir: Path) -> list["Account"]:
+    """Load YNAB accounts from YNAB_ACCOUNTS env var and merge with .env.notes.
+
+    Args:
+        script_dir: Directory containing .env.notes file.
+
+    Returns:
+        List of Account objects.
+
+    Raises:
+        SystemExit: If configuration is invalid.
+    """
+    # Import here to avoid circular reference at module level
+    from dataclasses import fields as dataclass_fields
+
+    del dataclass_fields  # Only imported to ensure Account is defined
+
+    accounts_json = os.getenv("YNAB_ACCOUNTS")
+    if not accounts_json:
+        return []
+
+    try:
+        accounts_data = json.loads(accounts_json)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Error: YNAB_ACCOUNTS is not valid JSON: {e}") from None
+
+    if not isinstance(accounts_data, list):
+        raise SystemExit("Error: YNAB_ACCOUNTS must be a JSON array") from None
+
+    # Parse .env.notes for account descriptions
+    env_notes = parse_env_notes(script_dir)
+
+    accounts: list[Account] = []
+    seen_names: set[str] = set()
+
+    for i, acct in enumerate(accounts_data):
+        if not isinstance(acct, dict):
+            raise SystemExit(f"Error: YNAB_ACCOUNTS[{i}] must be an object") from None
+
+        name = acct.get("name")
+        ynab_id = acct.get("ynab_id")
+
+        if not name:
+            raise SystemExit(f"Error: YNAB_ACCOUNTS[{i}] missing 'name'") from None
+        if not ynab_id:
+            raise SystemExit(f"Error: YNAB_ACCOUNTS[{i}] missing 'ynab_id'") from None
+
+        if name in seen_names:
+            raise SystemExit(f"Error: Duplicate account name '{name}'") from None
+        seen_names.add(name)
+
+        # Get notes from .env.notes file
+        notes = env_notes.get(name)
+
+        accounts.append(
+            Account(
+                name=name,
+                ynab_id=ynab_id,
+                notes=notes,
+                default=bool(acct.get("default", False)),
+            )
+        )
+
+    # Validate exactly one default account
+    default_accounts = [a for a in accounts if a.default]
+    if len(default_accounts) == 0:
+        raise SystemExit("Error: No account marked as default in YNAB_ACCOUNTS") from None
+    if len(default_accounts) > 1:
+        names = ", ".join(a.name for a in default_accounts)
+        raise SystemExit(f"Error: Multiple default accounts: {names}") from None
+
+    # Warn about accounts without notes
+    for acct in accounts:
+        if not acct.notes:
+            print(f"Warning: Account '{acct.name}' has no notes in .env.notes")
+
+    return accounts
+
+
+# Script directory for config files
+SCRIPT_DIR = Path(__file__).parent
+
 # Configuration dictionary - all settings loaded from environment
-CONFIG = {
+CONFIG: dict = {
     # API credentials
     "fastmail_token": os.getenv("FASTMAIL_TOKEN"),  # Fastmail JMAP bearer token
     "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY"),  # Claude API key
     "ynab_token": os.getenv("YNAB_TOKEN"),  # YNAB personal access token
     # YNAB target location
     "ynab_budget_id": os.getenv("YNAB_BUDGET_ID"),  # Budget to add transactions to
-    "ynab_account_id": os.getenv("YNAB_ACCOUNT_ID"),  # Account (e.g., credit card)
-    "ynab_amazon_account_id": os.getenv(
-        "YNAB_AMAZON_ACCOUNT_ID"
-    ),  # Optional: separate Amazon account
     # Processing settings
     "min_score": safe_int(os.getenv("MIN_SCORE"), 6),  # Min AI score (1-10) to import
 }
+
+# Load multi-account configuration
+# Deferred loading happens later, after the Account dataclass is defined
+ACCOUNTS: list["Account"] = []
+
+
+def _init_accounts():
+    """Initialize ACCOUNTS list after module load."""
+    global ACCOUNTS
+    ACCOUNTS = load_accounts(SCRIPT_DIR)
 
 # Database path - stored alongside the script for easy backup/inspection
 # Contains: processed_emails (tracking) and classification_cache (AI results)
@@ -160,6 +298,27 @@ YNAB_BASE_URL = "https://api.ynab.com/v1"  # YNAB REST API base
 # =============================================================================
 # Data Classes
 # =============================================================================
+
+
+@dataclass
+class Account:
+    """Represents a YNAB account for transaction routing.
+
+    Claude AI determines which account to route transactions to based on
+    account names and descriptions provided in the classification prompt.
+
+    Attributes:
+        name: Human-readable account name (e.g., "Chase Freedom", "Apple Card").
+        ynab_id: YNAB account UUID.
+        notes: Optional description to help AI route transactions correctly.
+        default: If True, this account receives transactions when no specific
+            account is detected. Exactly one account must be marked as default.
+    """
+
+    name: str
+    ynab_id: str
+    notes: str | None = None
+    default: bool = False
 
 
 @dataclass
@@ -209,6 +368,8 @@ class ClassificationResult:
         date: Transaction date in YYYY-MM-DD format.
         description: Brief description of what the transaction was for.
         reasoning: Claude's explanation of why it gave this score/classification.
+        account_name: Name of the YNAB account to route this transaction to,
+            or None to use the default account.
     """
 
     score: int
@@ -220,6 +381,7 @@ class ClassificationResult:
     date: str | None = None
     description: str | None = None
     reasoning: str | None = None
+    account_name: str | None = None
 
 
 @dataclass
@@ -425,6 +587,10 @@ def init_db():
         if "matched_payee" not in columns:
             cursor.execute("ALTER TABLE classification_cache ADD COLUMN matched_payee TEXT")
 
+        # Add account_name column if it doesn't exist (migration for multi-account routing)
+        if "account_name" not in columns:
+            cursor.execute("ALTER TABLE classification_cache ADD COLUMN account_name TEXT")
+
         # Table 3: Cache YNAB payees for name matching
         # Reduces API calls by caching payee list with delta updates
         cursor.execute("""
@@ -473,7 +639,7 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """SELECT score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning
+            """SELECT score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name
                FROM classification_cache WHERE email_id = ?""",
             (email_id,),
         )
@@ -492,6 +658,7 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
         date=row[6],
         description=row[7],
         reasoning=row[8],
+        account_name=row[9],
     )
 
 
@@ -508,8 +675,8 @@ def cache_classification(email_id: str, result: ClassificationResult):
         cursor = conn.cursor()
         cursor.execute(
             """INSERT OR REPLACE INTO classification_cache
-               (email_id, classified_at, score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (email_id, classified_at, score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 email_id,
                 datetime.now(UTC).isoformat(),
@@ -522,6 +689,7 @@ def cache_classification(email_id: str, result: ClassificationResult):
                 result.date,
                 result.description,
                 result.reasoning,
+                result.account_name,
             ),
         )
         conn.commit()
@@ -669,55 +837,51 @@ def delete_run_records(run_id: str):
 
 
 # =============================================================================
-# Amazon Routing
+# Account Routing
 # =============================================================================
 #
-# Amazon transactions are routed to a separate YNAB account for tracking.
-# This is useful when Amazon purchases are paid via a store card or gift
-# card balance rather than the primary credit card.
+# Transactions are routed to YNAB accounts based on AI classification.
+# Claude analyzes each email and determines which account it belongs to
+# based on the account descriptions provided in .env.notes.
 #
-# Detection checks both:
-#   - Merchant name contains "amazon" (case-insensitive)
-#   - Sender email contains "amazon" (e.g., @amazon.com, @amazon.co.uk)
-#
-# If either condition matches and YNAB_AMAZON_ACCOUNT_ID is configured,
-# the transaction goes to that account instead of the default.
+# If no account is specified or the account name is not found in the
+# configuration, the transaction is routed to the default account.
 # =============================================================================
 
 
-def is_amazon_transaction(merchant: str | None, from_email: str) -> bool:
-    """Check if a transaction is from Amazon.
-
-    Checks both the merchant name and email sender for "amazon".
+def get_default_account(accounts: list[Account]) -> Account:
+    """Get the default account from the configuration.
 
     Args:
-        merchant: The merchant name extracted by Claude.
-        from_email: The sender's email address.
+        accounts: List of configured Account objects.
 
     Returns:
-        True if either merchant or sender contains "amazon".
+        The account marked as default.
+
+    Raises:
+        ValueError: If no default account is configured.
     """
-    merchant_lower = (merchant or "").lower()
-    email_lower = from_email.lower()
-    return "amazon" in merchant_lower or "amazon" in email_lower
+    for acct in accounts:
+        if acct.default:
+            return acct
+    raise ValueError("No default account configured")
 
 
-def get_account_for_transaction(merchant: str | None, from_email: str) -> str:
-    """Get the YNAB account ID for a transaction.
-
-    Routes Amazon transactions to a separate account if configured.
+def get_account_for_transaction(account_name: str | None, accounts: list[Account]) -> Account:
+    """Get the YNAB account for a transaction based on AI classification.
 
     Args:
-        merchant: The merchant name extracted by Claude.
-        from_email: The sender's email address.
+        account_name: The account name from AI classification, or None.
+        accounts: List of configured Account objects.
 
     Returns:
-        The YNAB account ID to use for this transaction.
+        The matching Account, or the default account if not found.
     """
-    amazon_account = CONFIG["ynab_amazon_account_id"]
-    if amazon_account and is_amazon_transaction(merchant, from_email):
-        return amazon_account
-    return CONFIG["ynab_account_id"]
+    if account_name:
+        for acct in accounts:
+            if acct.name == account_name:
+                return acct
+    return get_default_account(accounts)
 
 
 # =============================================================================
@@ -992,7 +1156,10 @@ def fetch_recent_emails(token: str) -> list[Email]:
 
 
 def classify_email(
-    email: Email, client: anthropic.Anthropic, payee_names: list[str]
+    email: Email,
+    client: anthropic.Anthropic,
+    payee_names: list[str],
+    accounts: list[Account],
 ) -> ClassificationResult:
     """Use Claude to analyze an email and extract transaction details.
 
@@ -1001,6 +1168,7 @@ def classify_email(
     - Transaction direction (inflow = money received, outflow = money spent)
     - Structured data: merchant, amount, currency, date, description
     - Payee matching: match merchant to existing YNAB payee if possible
+    - Account routing: which YNAB account this transaction belongs to
 
     The prompt includes a scoring rubric:
         1-3: Not a transaction (marketing, shipping updates, etc.)
@@ -1012,6 +1180,7 @@ def classify_email(
         email: The email to classify.
         client: Initialized Anthropic client.
         payee_names: List of existing YNAB payee names for matching.
+        accounts: List of Account objects for routing.
 
     Returns:
         ClassificationResult with score and extracted data.
@@ -1024,6 +1193,16 @@ def classify_email(
     # Limit to 2000 payees to stay within reasonable token limits
     sorted_payees = sorted(payee_names)
     payee_list = "\n".join(sorted_payees[:2000])
+
+    # Format account list for the prompt
+    account_lines = []
+    for acct in accounts:
+        default_marker = " (DEFAULT)" if acct.default else ""
+        account_lines.append(f"- {acct.name}{default_marker}")
+        if acct.notes:
+            # Indent notes under account name
+            account_lines.extend(f"  {line}" for line in acct.notes.splitlines())
+    accounts_text = "\n".join(account_lines) if account_lines else "(no accounts configured)"
 
     # Structured prompt asking for JSON output
     # Includes scoring rubric and field definitions
@@ -1039,6 +1218,11 @@ BODY:
 
 EXISTING PAYEES (for matching):
 {payee_list}
+
+---
+
+ACCOUNTS (for routing):
+{accounts_text}
 
 ---
 
@@ -1058,6 +1242,7 @@ Respond with JSON in this exact format:
   "direction": "outflow",
   "merchant": "Store Name or Source",
   "matched_payee": "Existing Payee Name",
+  "account_name": "Account Name",
   "amount": 29.99,
   "currency": "USD",
   "date": "2024-01-15",
@@ -1072,6 +1257,7 @@ Rules:
 - "date" must be YYYY-MM-DD format. Use the transaction date, not the email date. Use null if not found.
 - "merchant" should be the business/source name as it appears in the email, or null if not found
 - "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "Co.", etc. Only use a value from the provided list.
+- "account_name" should be the EXACT name from the ACCOUNTS list that this transaction belongs to based on the account descriptions. Use null to route to the default account. Only use a value from the provided list.
 - "description" should briefly describe the transaction
 
 Examples of OUTFLOW: purchase receipts, subscription charges, bill payments, fees
@@ -1114,6 +1300,7 @@ Respond ONLY with valid JSON, no other text."""
             date=data.get("date"),
             description=data.get("description"),
             reasoning=data.get("reasoning"),
+            account_name=data.get("account_name"),
         )
 
     except (KeyError, ValueError) as e:
@@ -1561,11 +1748,17 @@ def process_emails(force: bool = False, confirm: bool = False):
             emails as processed.
     """
     # Validate all required config is present
-    OPTIONAL_CONFIG = {"ynab_amazon_account_id"}
-    missing = [k for k, v in CONFIG.items() if not v and k not in OPTIONAL_CONFIG]
+    missing = [k for k, v in CONFIG.items() if not v]
     if missing:
         print(f"Error: Missing configuration: {', '.join(missing)}")
         print("Copy .env.example to .env and fill in your credentials.")
+        return
+
+    # Load and validate multi-account configuration
+    _init_accounts()
+    if not ACCOUNTS:
+        print("Error: No accounts configured. Set YNAB_ACCOUNTS in .env")
+        print("Example: YNAB_ACCOUNTS='[{\"name\": \"My Card\", \"ynab_id\": \"abc-123\", \"default\": true}]'")
         return
 
     # Acquire exclusive lock to prevent concurrent execution
@@ -1633,7 +1826,7 @@ def _process_emails_impl(force: bool, confirm: bool):
                 cached += 1
             else:
                 # No cache hit - call Claude API and cache the result
-                result = classify_email(email, client, payee_names)
+                result = classify_email(email, client, payee_names, ACCOUNTS)
                 cache_classification(email.id, result)
 
             direction_str = "INFLOW" if result.is_inflow else "OUTFLOW"
@@ -1678,10 +1871,13 @@ def _process_emails_impl(force: bool, confirm: bool):
             if result.matched_payee and result.matched_payee != result.merchant:
                 print(f"    -> Matched payee: '{result.merchant}' -> '{result.matched_payee}'")
 
-            # Determine which account to use (Amazon routing)
-            account_id = get_account_for_transaction(result.merchant, email.from_email)
-            if account_id == CONFIG["ynab_amazon_account_id"]:
-                print("    -> Routing to Amazon account")
+            # Determine which account to use based on AI classification
+            account = get_account_for_transaction(result.account_name, ACCOUNTS)
+            if result.account_name and result.account_name == account.name:
+                print(f"    -> Routing to account: {account.name}")
+            elif result.account_name:
+                # AI suggested an account that doesn't exist, using default
+                print(f"    -> Unknown account '{result.account_name}', using default: {account.name}")
 
             # Generate import_id for YNAB deduplication
             import_id = generate_import_id(email.id, result.amount, transaction_date, force=force)
@@ -1702,7 +1898,7 @@ def _process_emails_impl(force: bool, confirm: bool):
             pending_transactions.append(
                 PendingTransaction(
                     email_id=email.id,
-                    account_id=account_id,
+                    account_id=account.ynab_id,
                     amount=result.amount,
                     date=transaction_date,
                     payee_name=final_payee[:50],

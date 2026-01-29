@@ -1,5 +1,6 @@
-# Environment variables (contains API keys)
+# Environment variables (contains API keys and account info)
 .env
+.env.notes
 
 # Local database (contains user data)
 processed_emails.db

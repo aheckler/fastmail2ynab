@@ -7,7 +7,7 @@ A local Python script that automatically detects receipt emails in Fastmail and 
 1. Fetches recent emails from your Fastmail inbox via JMAP
 2. Uses Claude to classify each email and extract transaction details (merchant, amount, date, inflow/outflow)
 3. Matches merchant names to existing YNAB payees using fuzzy matching for consistent naming
-4. Routes Amazon transactions to a separate account (configurable)
+4. Routes transactions to the appropriate YNAB account based on AI classification
 5. Creates unapproved transactions in YNAB in batches of 5
 6. Tracks processed emails and run history in a local SQLite database
 
@@ -25,6 +25,7 @@ brew install uv
 
 ```bash
 cp .env.example .env
+cp .env.notes.example .env.notes
 ```
 
 Edit `.env` with your credentials:
@@ -36,12 +37,47 @@ Edit `.env` with your credentials:
 **YNAB:**
 1. Go to Account Settings -> Developer Settings
 2. Create a Personal Access Token
+3. Get account IDs from the URL when viewing each account
 
 **Anthropic:**
 1. Go to [console.anthropic.com](https://console.anthropic.com/)
 2. Create an API key
 
-### 3. Run the script
+### 3. Configure accounts
+
+Edit the `YNAB_ACCOUNTS` setting in `.env`:
+
+```json
+[
+  {"name": "Chase Freedom", "ynab_id": "abc-123-your-account-id", "default": true},
+  {"name": "Apple Card", "ynab_id": "def-456-your-account-id"},
+  {"name": "SoFi Checking", "ynab_id": "ghi-789-your-account-id"}
+]
+```
+
+- Each account must have a `name` and `ynab_id`
+- Exactly one account must have `"default": true`
+- Get `ynab_id` from the YNAB URL: `app.ynab.com/.../accounts/ACCOUNT_ID_HERE`
+
+### 4. Add account descriptions (optional but recommended)
+
+Edit `.env.notes` to describe each account:
+
+```
+Chase Freedom:
+Primary credit card. Default for unknown transactions. Most merchant receipts go here.
+
+Apple Card:
+Goldman Sachs Apple Card. Emails from @apple.com with "Apple Card Transaction".
+Used for Apple subscriptions and App Store purchases.
+
+SoFi Checking:
+Main checking account. Emails from @sofi.com mentioning "checking" or "direct deposit".
+```
+
+These descriptions help Claude route transactions to the correct account.
+
+### 5. Run the script
 
 ```bash
 uv run fastmail2ynab.py
@@ -128,7 +164,6 @@ Edit `.env` to adjust optional settings:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MIN_SCORE` | 6 | Minimum AI score (1-10) to import a transaction |
-| `YNAB_AMAZON_ACCOUNT_ID` | (none) | Route Amazon transactions to a separate account |
 
 ## How scoring works
 
@@ -150,7 +185,17 @@ Claude also determines whether each transaction is:
 
 This is reflected correctly in YNAB—outflows show as negative amounts, inflows as positive.
 
-Each imported transaction includes a memo in the format: `fm2ynab | Score: 8/10`
+Each imported transaction includes a memo in the format: `fm2ynab | Run: abc12345`
+
+## Multi-Account Routing
+
+Claude determines which YNAB account each transaction belongs to based on:
+
+1. **Account descriptions** in `.env.notes` - Detailed descriptions help Claude understand which emails belong to which account
+2. **Email sender** - e.g., emails from @apple.com might go to Apple Card
+3. **Email content** - e.g., "SoFi Checking" mentioned in the email
+
+If Claude can't determine the account, or the suggested account doesn't exist, the transaction goes to the default account.
 
 ## Data storage
 
@@ -176,16 +221,6 @@ When classifying emails, Claude matches the extracted merchant name to your exis
 
 This ensures transactions use your existing payee names for consistent categorization and reporting.
 
-## Amazon Routing
-
-If `YNAB_AMAZON_ACCOUNT_ID` is set in `.env`, transactions from Amazon are automatically routed to that account instead of the default. This is useful if you pay for Amazon purchases with a store card or gift card balance.
-
-Detection checks both:
-- Merchant name contains "amazon" (case-insensitive)
-- Sender email contains "amazon" (e.g., @amazon.com, @amazon.co.uk)
-
-If not configured, Amazon transactions go to the default account like everything else.
-
 ## Costs
 
 **Claude API:**
@@ -197,11 +232,17 @@ If not configured, Amazon transactions go to the default account like everything
 **"Missing configuration"**
 - Ensure `.env` exists and all values are filled in
 
+**"No accounts configured"**
+- Add `YNAB_ACCOUNTS` to your `.env` file (see Setup section)
+
+**"No account marked as default"**
+- One account in `YNAB_ACCOUNTS` must have `"default": true`
+
 **"Could not find Inbox"**
 - Verify your Fastmail token has mail read permissions
 
 **YNAB 400 errors**
-- Check that your budget ID and account ID are correct
+- Check that your budget ID and account IDs are correct
 - Verify your YNAB token hasn't expired
 
 **Duplicate transactions**
@@ -211,6 +252,10 @@ If not configured, Amazon transactions go to the default account like everything
 **Payee names not matching**
 - Payee cache refreshes every 24 hours automatically using delta updates
 - Use `--clear-cache` to re-classify emails if you've added new payees to YNAB
+
+**Transactions going to wrong account**
+- Improve account descriptions in `.env.notes`
+- Use `--clear-cache` to re-classify emails with updated descriptions
 
 **Want to re-analyze emails with Claude**
 - Use `--clear-cache` to clear classifications and re-analyze all emails
