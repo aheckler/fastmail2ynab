@@ -15,14 +15,15 @@ This script integrates three systems to automate personal finance tracking:
 
     1. Fastmail (JMAP API) - Fetches recent emails from your inbox
     2. Claude AI (Anthropic API) - Analyzes emails to identify receipts and
-       extract transaction details (merchant, amount, date, direction)
+       extract transaction details (merchant, amount, date, direction, account)
     3. YNAB (API) - Creates unapproved transactions for review
 
 The workflow:
     - Fetch the 100 most recent emails from inbox
     - For each unprocessed email, ask Claude to score it (1-10) as a receipt
     - If score meets threshold, extract merchant/amount/date
-    - Create an unapproved transaction in YNAB
+    - Create an unapproved transaction in YNAB (or scheduled transaction for
+      future-dated bills with high confidence)
     - Track processed emails in SQLite to avoid duplicates
 
 Usage:
@@ -258,6 +259,7 @@ def _init_accounts():
     global ACCOUNTS
     ACCOUNTS = load_accounts(SCRIPT_DIR)
 
+
 # Database path - stored alongside the script for easy backup/inspection
 # Contains: processed_emails (tracking) and classification_cache (AI results)
 DB_PATH = Path(__file__).parent / "processed_emails.db"
@@ -379,6 +381,7 @@ class ClassificationResult:
     amount: float | None = None
     currency: str | None = None
     date: str | None = None
+    date_confidence: str | None = None  # "certain", "likely", or None
     description: str | None = None
     reasoning: str | None = None
     account_name: str | None = None
@@ -389,7 +392,7 @@ class PendingTransaction:
     """A transaction ready to be created in YNAB.
 
     Used for batch transaction creation - we collect all pending transactions
-    first, then create them in batches of 5.
+    first, then create them in batches of 5. Also used for scheduled transactions.
 
     Attributes:
         email_id: Fastmail's unique email identifier.
@@ -398,8 +401,9 @@ class PendingTransaction:
         date: Transaction date in YYYY-MM-DD format.
         payee_name: Merchant or source name.
         memo: Optional memo/notes for the transaction.
-        import_id: Unique ID for YNAB deduplication.
+        import_id: Unique ID for YNAB deduplication (not used for scheduled).
         is_inflow: True for money received, False for money spent.
+        is_scheduled: True for scheduled transactions (future dates).
     """
 
     email_id: str
@@ -408,28 +412,40 @@ class PendingTransaction:
     date: str
     payee_name: str
     memo: str
-    import_id: str
+    import_id: str | None
     is_inflow: bool
+    is_scheduled: bool = False
 
 
-def validate_transaction_date(date_str: str | None, email_received_at: str) -> str | None:
-    """Validate and fix transaction date for YNAB constraints.
+def validate_transaction_date(
+    date_str: str | None, email_received_at: str
+) -> tuple[str | None, bool]:
+    """Validate transaction date and determine if it's in the future.
 
-    YNAB requires dates to be:
-    - Not in the future
-    - Not more than 5 years ago
+    YNAB's regular transactions API requires dates not in the future.
+    For future dates (like autopay due dates), callers should use the
+    scheduled transactions API when confidence is high.
 
-    Returns a valid YYYY-MM-DD date string, or None if unrecoverable.
+    Args:
+        date_str: Extracted date string in YYYY-MM-DD format, or None.
+        email_received_at: ISO timestamp when email was received (fallback).
+
+    Returns:
+        Tuple of (validated_date, is_future):
+        - validated_date: A valid YYYY-MM-DD string, or None if unrecoverable
+        - is_future: True if the date is in the future (after today)
     """
     today = datetime.now(UTC).date()
     five_years_ago = today - timedelta(days=5 * 365)
+    ninety_days_future = today + timedelta(days=90)
 
     # Try the extracted date first
     if date_str:
         try:
             parsed = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC).date()
-            if five_years_ago <= parsed <= today:
-                return date_str  # Valid date
+            if five_years_ago <= parsed <= ninety_days_future:
+                is_future = parsed > today
+                return (date_str, is_future)
         except ValueError:
             pass  # Invalid format, fall through
 
@@ -439,11 +455,11 @@ def validate_transaction_date(date_str: str | None, email_received_at: str) -> s
         fallback = received_dt.strftime("%Y-%m-%d")
         parsed = datetime.strptime(fallback, "%Y-%m-%d").replace(tzinfo=UTC).date()
         if five_years_ago <= parsed <= today:
-            return fallback
+            return (fallback, False)  # Email date is never future
     except (ValueError, AttributeError):
         pass
 
-    return None  # Unrecoverable
+    return (None, False)  # Unrecoverable
 
 
 # =============================================================================
@@ -591,6 +607,10 @@ def init_db():
         if "account_name" not in columns:
             cursor.execute("ALTER TABLE classification_cache ADD COLUMN account_name TEXT")
 
+        # Add date_confidence column if it doesn't exist (migration for scheduled transactions)
+        if "date_confidence" not in columns:
+            cursor.execute("ALTER TABLE classification_cache ADD COLUMN date_confidence TEXT")
+
         # Table 3: Cache YNAB payees for name matching
         # Reduces API calls by caching payee list with delta updates
         cursor.execute("""
@@ -639,7 +659,7 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """SELECT score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name
+            """SELECT score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name, date_confidence
                FROM classification_cache WHERE email_id = ?""",
             (email_id,),
         )
@@ -659,6 +679,7 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
         description=row[7],
         reasoning=row[8],
         account_name=row[9],
+        date_confidence=row[10],
     )
 
 
@@ -675,8 +696,8 @@ def cache_classification(email_id: str, result: ClassificationResult):
         cursor = conn.cursor()
         cursor.execute(
             """INSERT OR REPLACE INTO classification_cache
-               (email_id, classified_at, score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (email_id, classified_at, score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name, date_confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 email_id,
                 datetime.now(UTC).isoformat(),
@@ -690,6 +711,7 @@ def cache_classification(email_id: str, result: ClassificationResult):
                 result.description,
                 result.reasoning,
                 result.account_name,
+                result.date_confidence,
             ),
         )
         conn.commit()
@@ -1270,6 +1292,7 @@ Respond with JSON in this exact format:
   "amount": 29.99,
   "currency": "USD",
   "date": "2024-01-15",
+  "date_confidence": "certain",
   "description": "Brief description of transaction",
   "reasoning": "Why you gave this score and direction"
 }}
@@ -1278,7 +1301,12 @@ Rules:
 - "score" must be an integer from 1-10
 - "direction" must be either "inflow" or "outflow"
 - "amount" must be a positive number (no currency symbols), or null if not found
-- "date" must be YYYY-MM-DD format. Use the transaction date, not the email date. Use null if not found.
+- "date" must be YYYY-MM-DD format. For purchase receipts, use the purchase date. For bills with autopay, use the due date (when payment will be charged). For payment confirmations, use the payment date. Use null if not found.
+- "date_confidence" indicates how certain you are about the date:
+  - "certain": The email explicitly states this exact date (e.g., "Due Date: Feb 19, 2026" or "Payment scheduled for 2/19/26")
+  - "likely": The date is implied but not explicitly stated
+  - null: Date was inferred or uncertain
+  Future dates require "certain" confidence to be used; otherwise they'll be adjusted to today.
 - "merchant" should be the business/source name as it appears in the email, or null if not found
 - "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "Co.", etc. Only use a value from the provided list.
 - "account_name" should be the EXACT name from the ACCOUNTS list that this transaction belongs to based on the account descriptions. Use null to route to the default account. Only use a value from the provided list.
@@ -1322,6 +1350,7 @@ Respond ONLY with valid JSON, no other text."""
             amount=float(data["amount"]) if data.get("amount") else None,
             currency=data.get("currency", "USD"),
             date=data.get("date"),
+            date_confidence=data.get("date_confidence"),
             description=data.get("description"),
             reasoning=data.get("reasoning"),
             account_name=data.get("account_name"),
@@ -1528,6 +1557,75 @@ def create_ynab_transactions_batch(
             created_idx += 1
 
     return results
+
+
+def create_ynab_scheduled_transaction(
+    token: str,
+    budget_id: str,
+    account_id: str,
+    date: str,
+    amount: float,
+    payee_name: str,
+    memo: str | None,
+    is_inflow: bool = False,
+) -> str:
+    """Create a one-time scheduled transaction in YNAB for a future date.
+
+    YNAB's regular transactions API doesn't accept future dates. For bills
+    with known autopay dates, we use scheduled transactions instead.
+
+    Args:
+        token: YNAB personal access token.
+        budget_id: Target budget UUID.
+        account_id: Target account UUID.
+        date: Transaction date in YYYY-MM-DD format (must be in the future).
+        amount: Transaction amount as a positive float.
+        payee_name: Merchant or source name.
+        memo: Optional memo/notes for the transaction.
+        is_inflow: True for money received, False for money spent.
+
+    Returns:
+        The scheduled transaction ID.
+
+    Raises:
+        requests.HTTPError: If the API request fails.
+    """
+    # Convert to YNAB milliunits: $29.99 = 29990
+    milliunits = round(amount * 1000)
+    if not is_inflow:
+        milliunits = -milliunits
+
+    # Build scheduled transaction payload
+    # frequency: "never" creates a one-time scheduled transaction
+    scheduled_transaction = {
+        "account_id": account_id,
+        "date": date,
+        "frequency": "never",
+        "amount": milliunits,
+        "payee_name": payee_name,
+        "memo": memo,
+    }
+
+    response = requests.post(
+        f"{YNAB_BASE_URL}/budgets/{budget_id}/scheduled_transactions",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"scheduled_transaction": scheduled_transaction},
+        timeout=30,
+    )
+
+    if not response.ok:
+        try:
+            error_data = response.json().get("error", {})
+            error_detail = error_data.get("detail", response.text)
+        except Exception:
+            error_detail = response.text
+        print(f"    -> YNAB API error: {error_detail}")
+    response.raise_for_status()
+
+    return response.json()["data"]["scheduled_transaction"]["id"]
 
 
 def delete_ynab_transaction(token: str, budget_id: str, transaction_id: str) -> bool:
@@ -1782,7 +1880,9 @@ def process_emails(force: bool = False, confirm: bool = False):
     _init_accounts()
     if not ACCOUNTS:
         print("Error: No accounts configured. Set YNAB_ACCOUNTS in .env")
-        print("Example: YNAB_ACCOUNTS='[{\"name\": \"My Card\", \"ynab_id\": \"abc-123\", \"default\": true}]'")
+        print(
+            'Example: YNAB_ACCOUNTS=\'[{"name": "My Card", "ynab_id": "abc-123", "default": true}]\''
+        )
         return
 
     # Acquire exclusive lock to prevent concurrent execution
@@ -1819,6 +1919,7 @@ def _process_emails_impl(force: bool, confirm: bool):
 
     # Statistics counters
     receipts_added = 0  # New transactions created in YNAB
+    scheduled_added = 0  # Scheduled transactions created for future dates
     duplicates = 0  # Skipped due to YNAB import_id conflict
     skipped = 0  # Skipped due to already in our processed_emails table
     cached = 0  # Used cached Claude classification (saved API calls)
@@ -1871,15 +1972,27 @@ def _process_emails_impl(force: bool, confirm: bool):
                 continue
 
             # Determine transaction date
-            # Validates date format and YNAB constraints (not future, not >5 years old)
-            # Falls back to email received date if extracted date is invalid
-            transaction_date = validate_transaction_date(result.date, email.received_at)
+            # Returns (validated_date, is_future) tuple
+            transaction_date, is_future = validate_transaction_date(result.date, email.received_at)
             if not transaction_date:
                 print("    -> Invalid date and could not recover, skipping")
                 non_receipt_emails.append(email.id)
                 continue
 
-            if transaction_date != result.date:
+            # Route future dates with high confidence to scheduled transactions API
+            use_scheduled_api = is_future and result.date_confidence == "certain"
+
+            # For future dates without high confidence, cap to today
+            display_date = transaction_date
+            if is_future and not use_scheduled_api:
+                today_str = datetime.now(UTC).date().strftime("%Y-%m-%d")
+                print(
+                    f"    -> Date adjusted: {transaction_date} -> {today_str} "
+                    f"(confidence: {result.date_confidence or 'unknown'})"
+                )
+                transaction_date = today_str
+
+            if transaction_date != result.date and not is_future:
                 if result.date:
                     print(f"    -> Date adjusted: {result.date} -> {transaction_date}")
                 else:
@@ -1901,36 +2014,57 @@ def _process_emails_impl(force: bool, confirm: bool):
                 print(f"    -> Routing to account: {account.name}")
             elif result.account_name:
                 # AI suggested an account that doesn't exist, using default
-                print(f"    -> Unknown account '{result.account_name}', using default: {account.name}")
-
-            # Generate import_id for YNAB deduplication
-            import_id = generate_import_id(email.id, result.amount, transaction_date, force=force)
+                print(
+                    f"    -> Unknown account '{result.account_name}', using default: {account.name}"
+                )
 
             # Build memo with metadata for reference in YNAB
             memo = f"fm2ynab | Run: {run_id[:8]}"
 
-            # Store display data for summary table
+            # Store display data for summary table (use original date for display)
             transaction_display_data[email.id] = (
-                transaction_date,
+                display_date if use_scheduled_api else transaction_date,
                 final_payee,
                 result.amount,
                 result.is_inflow,
                 result.score,
             )
 
-            # Add to pending transactions for batch creation
-            pending_transactions.append(
-                PendingTransaction(
-                    email_id=email.id,
-                    account_id=account.ynab_id,
-                    amount=result.amount,
-                    date=transaction_date,
-                    payee_name=final_payee[:50],
-                    memo=memo,
-                    import_id=import_id,
-                    is_inflow=result.is_inflow,
+            if use_scheduled_api:
+                # Add scheduled transaction to pending list (created after selection)
+                pending_transactions.append(
+                    PendingTransaction(
+                        email_id=email.id,
+                        account_id=account.ynab_id,
+                        amount=result.amount,
+                        date=transaction_date,
+                        payee_name=final_payee[:50],
+                        memo=memo,
+                        import_id=None,  # Scheduled transactions don't use import_id
+                        is_inflow=result.is_inflow,
+                        is_scheduled=True,
+                    )
                 )
-            )
+            else:
+                # Generate import_id for YNAB deduplication
+                import_id = generate_import_id(
+                    email.id, result.amount, transaction_date, force=force
+                )
+
+                # Add regular transaction to pending list for batch creation
+                pending_transactions.append(
+                    PendingTransaction(
+                        email_id=email.id,
+                        account_id=account.ynab_id,
+                        amount=result.amount,
+                        date=transaction_date,
+                        payee_name=final_payee[:50],
+                        memo=memo,
+                        import_id=import_id,
+                        is_inflow=result.is_inflow,
+                        is_scheduled=False,
+                    )
+                )
 
         except Exception as e:
             print(f"    -> Error: {e}")
@@ -1972,15 +2106,44 @@ def _process_emails_impl(force: bool, confirm: bool):
         for email_id in non_receipt_emails:
             mark_processed(email_id, is_receipt=False, run_id=run_id)
 
-    # Batch create transactions in YNAB
-    if pending_transactions:
+    # Split into scheduled and regular transactions
+    scheduled_transactions = [t for t in pending_transactions if t.is_scheduled]
+    regular_transactions = [t for t in pending_transactions if not t.is_scheduled]
+
+    # Create scheduled transactions in YNAB (one at a time, no batch API)
+    if scheduled_transactions:
         print()
-        print(f"Creating {len(pending_transactions)} transactions in YNAB...")
+        print(f"Creating {len(scheduled_transactions)} scheduled transaction(s) in YNAB...")
+
+        for txn in scheduled_transactions:
+            try:
+                scheduled_id = create_ynab_scheduled_transaction(
+                    token=CONFIG["ynab_token"],
+                    budget_id=CONFIG["ynab_budget_id"],
+                    account_id=txn.account_id,
+                    date=txn.date,
+                    amount=txn.amount,
+                    payee_name=txn.payee_name,
+                    memo=txn.memo,
+                    is_inflow=txn.is_inflow,
+                )
+                print(f"    -> Created scheduled for {txn.date}: {scheduled_id}")
+                mark_processed(txn.email_id, is_receipt=True, ynab_id=scheduled_id, run_id=run_id)
+                scheduled_added += 1
+                created_email_ids.append(txn.email_id)
+            except Exception as e:
+                print(f"    -> Error creating scheduled transaction: {e}")
+                errors += 1
+
+    # Batch create regular transactions in YNAB
+    if regular_transactions:
+        print()
+        print(f"Creating {len(regular_transactions)} transaction(s) in YNAB...")
 
         # Process in batches of 5
         batch_size = 5
-        for i in range(0, len(pending_transactions), batch_size):
-            batch = pending_transactions[i : i + batch_size]
+        for i in range(0, len(regular_transactions), batch_size):
+            batch = regular_transactions[i : i + batch_size]
             print(f"  Batch {i // batch_size + 1}: {len(batch)} transactions")
 
             try:
@@ -2006,10 +2169,10 @@ def _process_emails_impl(force: bool, confirm: bool):
                 print(f"    -> {traceback.format_exc()}")
                 errors += len(batch)
 
-        # Complete the run
-        complete_run(run_id, receipts_added)
+    # Complete the run
+    if scheduled_transactions or regular_transactions:
+        complete_run(run_id, receipts_added + scheduled_added)
     else:
-        # No transactions to create, but still complete the run
         complete_run(run_id, 0)
 
     # Print transaction summary table
@@ -2041,8 +2204,9 @@ def _process_emails_impl(force: bool, confirm: bool):
 
     # Print summary statistics
     print()
+    scheduled_msg = f", {scheduled_added} scheduled" if scheduled_added else ""
     print(
-        f"Done! {receipts_added} added, {duplicates} already in YNAB, {skipped} skipped, {cached} from cache, {errors} errors"
+        f"Done! {receipts_added} added{scheduled_msg}, {duplicates} already in YNAB, {skipped} skipped, {cached} from cache, {errors} errors"
     )
 
 

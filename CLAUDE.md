@@ -53,18 +53,19 @@ uv run fastmail2ynab.py --help
 The entire application is in a single file (`fastmail2ynab.py`) with these main components:
 
 1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol
-2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, date, inflow/outflow, account)
-3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching
+2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, date, date_confidence, inflow/outflow, account)
+3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence.
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
 5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`
-6. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata), `runs` (script execution history for undo)
+6. **Scheduled transactions**: Future dates (like autopay due dates) with "certain" confidence use YNAB's scheduled transactions API; others are capped to today
+7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata), `runs` (script execution history for undo)
 
 ## Key Data Structures
 
 - `Account`: name, ynab_id, notes, default (for multi-account routing)
 - `Email`: id, subject, from_email, received_at, body
-- `ClassificationResult`: score (1-10), is_inflow, merchant, amount, currency, date, description, reasoning, account_name
-- `PendingTransaction`: email_id, account_id, amount, date, payee_name, memo, import_id, is_inflow (used for batch creation)
+- `ClassificationResult`: score (1-10), is_inflow, merchant, amount, currency, date, date_confidence ("certain"/"likely"/None), description, reasoning, account_name
+- `PendingTransaction`: email_id, account_id, amount, date, payee_name, memo, import_id, is_inflow, is_scheduled (used for batch creation and scheduled transactions)
 
 ## Configuration
 

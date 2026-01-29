@@ -196,6 +196,15 @@ Claude determines which YNAB account each transaction belongs to based on:
 
 If Claude can't determine the account, or the suggested account doesn't exist, the transaction goes to the default account.
 
+## Scheduled Transactions for Future Dates
+
+For bills with autopay due dates in the future (like "Due Date: Feb 19, 2026"), the script uses YNAB's scheduled transactions API when Claude is confident about the date:
+
+- **"certain" confidence**: The email explicitly states the exact date (e.g., "Due Date: Feb 19, 2026"). Creates a one-time scheduled transaction for that future date.
+- **"likely" or unknown confidence**: The date is implied or uncertain. The transaction is created with today's date instead.
+
+This prevents incorrect future-dated transactions while properly handling autopay bills where the due date is clearly stated.
+
 ## Data storage
 
 All data is stored in `processed_emails.db` (SQLite) with five tables:
