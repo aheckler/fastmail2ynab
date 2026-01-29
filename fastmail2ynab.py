@@ -554,6 +554,11 @@ def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
 
+        def ensure_column(table: str, column: str, col_type: str = "TEXT"):
+            cursor.execute(f"PRAGMA table_info({table})")
+            if column not in [row[1] for row in cursor.fetchall()]:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
         # Table 1: Track which emails have been processed
         # email_id: Fastmail's unique email ID (primary key)
         # processed_at: ISO timestamp when we processed this email
@@ -571,10 +576,7 @@ def init_db():
         """)
 
         # Add run_id column if it doesn't exist (migration for existing databases)
-        cursor.execute("PRAGMA table_info(processed_emails)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if "run_id" not in columns:
-            cursor.execute("ALTER TABLE processed_emails ADD COLUMN run_id TEXT")
+        ensure_column("processed_emails", "run_id")
 
         # Table 2: Cache Claude's classification results
         # This avoids paying for repeat API calls when:
@@ -597,19 +599,10 @@ def init_db():
             )
         """)
 
-        # Add matched_payee column if it doesn't exist (migration for existing databases)
-        cursor.execute("PRAGMA table_info(classification_cache)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if "matched_payee" not in columns:
-            cursor.execute("ALTER TABLE classification_cache ADD COLUMN matched_payee TEXT")
-
-        # Add account_name column if it doesn't exist (migration for multi-account routing)
-        if "account_name" not in columns:
-            cursor.execute("ALTER TABLE classification_cache ADD COLUMN account_name TEXT")
-
-        # Add date_confidence column if it doesn't exist (migration for scheduled transactions)
-        if "date_confidence" not in columns:
-            cursor.execute("ALTER TABLE classification_cache ADD COLUMN date_confidence TEXT")
+        # Add columns if they don't exist (migrations for existing databases)
+        ensure_column("classification_cache", "matched_payee")
+        ensure_column("classification_cache", "account_name")
+        ensure_column("classification_cache", "date_confidence")
 
         # Table 3: Cache YNAB payees for name matching
         # Reduces API calls by caching payee list with delta updates
@@ -715,6 +708,20 @@ def cache_classification(email_id: str, result: ClassificationResult):
             ),
         )
         conn.commit()
+
+
+def to_milliunits(amount: float, is_inflow: bool) -> int:
+    """Convert amount to YNAB milliunits (positive=inflow, negative=outflow)."""
+    milliunits = round(amount * 1000)
+    return milliunits if is_inflow else -milliunits
+
+
+def extract_ynab_error(response: requests.Response) -> str:
+    """Extract error detail from YNAB API response."""
+    try:
+        return response.json().get("error", {}).get("detail", response.text)
+    except Exception:
+        return response.text
 
 
 def is_processed(email_id: str) -> bool:
@@ -1443,9 +1450,7 @@ def create_ynab_transaction(
     """
     # Convert to YNAB milliunits: $29.99 = 29990
     # Positive = inflow (deposits, refunds), Negative = outflow (purchases)
-    milliunits = round(amount * 1000)
-    if not is_inflow:
-        milliunits = -milliunits
+    milliunits = to_milliunits(amount, is_inflow)
 
     # Build transaction payload
     transaction = {
@@ -1505,9 +1510,7 @@ def create_ynab_transactions_batch(
     # Build the transactions payload
     transactions = []
     for pt in pending_transactions:
-        milliunits = round(pt.amount * 1000)
-        if not pt.is_inflow:
-            milliunits = -milliunits
+        milliunits = to_milliunits(pt.amount, pt.is_inflow)
 
         transactions.append(
             {
@@ -1532,13 +1535,7 @@ def create_ynab_transactions_batch(
         timeout=30,
     )
     if not response.ok:
-        # Extract YNAB error details before raising
-        try:
-            error_data = response.json().get("error", {})
-            error_detail = error_data.get("detail", response.text)
-        except Exception:
-            error_detail = response.text
-        print(f"    -> YNAB API error: {error_detail}")
+        print(f"    -> YNAB API error: {extract_ynab_error(response)}")
     response.raise_for_status()
 
     data = response.json()["data"]
@@ -1591,9 +1588,7 @@ def create_ynab_scheduled_transaction(
         requests.HTTPError: If the API request fails.
     """
     # Convert to YNAB milliunits: $29.99 = 29990
-    milliunits = round(amount * 1000)
-    if not is_inflow:
-        milliunits = -milliunits
+    milliunits = to_milliunits(amount, is_inflow)
 
     # Build scheduled transaction payload
     # frequency: "never" creates a one-time scheduled transaction
@@ -1617,12 +1612,7 @@ def create_ynab_scheduled_transaction(
     )
 
     if not response.ok:
-        try:
-            error_data = response.json().get("error", {})
-            error_detail = error_data.get("detail", response.text)
-        except Exception:
-            error_detail = response.text
-        print(f"    -> YNAB API error: {error_detail}")
+        print(f"    -> YNAB API error: {extract_ynab_error(response)}")
     response.raise_for_status()
 
     return response.json()["data"]["scheduled_transaction"]["id"]
@@ -2030,41 +2020,25 @@ def _process_emails_impl(force: bool, confirm: bool):
                 result.score,
             )
 
-            if use_scheduled_api:
-                # Add scheduled transaction to pending list (created after selection)
-                pending_transactions.append(
-                    PendingTransaction(
-                        email_id=email.id,
-                        account_id=account.ynab_id,
-                        amount=result.amount,
-                        date=transaction_date,
-                        payee_name=final_payee[:50],
-                        memo=memo,
-                        import_id=None,  # Scheduled transactions don't use import_id
-                        is_inflow=result.is_inflow,
-                        is_scheduled=True,
-                    )
+            # Generate import_id for YNAB deduplication (not used for scheduled)
+            import_id = (
+                None
+                if use_scheduled_api
+                else generate_import_id(email.id, result.amount, transaction_date, force=force)
+            )
+            pending_transactions.append(
+                PendingTransaction(
+                    email_id=email.id,
+                    account_id=account.ynab_id,
+                    amount=result.amount,
+                    date=transaction_date,
+                    payee_name=final_payee[:50],
+                    memo=memo,
+                    import_id=import_id,
+                    is_inflow=result.is_inflow,
+                    is_scheduled=use_scheduled_api,
                 )
-            else:
-                # Generate import_id for YNAB deduplication
-                import_id = generate_import_id(
-                    email.id, result.amount, transaction_date, force=force
-                )
-
-                # Add regular transaction to pending list for batch creation
-                pending_transactions.append(
-                    PendingTransaction(
-                        email_id=email.id,
-                        account_id=account.ynab_id,
-                        amount=result.amount,
-                        date=transaction_date,
-                        payee_name=final_payee[:50],
-                        memo=memo,
-                        import_id=import_id,
-                        is_inflow=result.is_inflow,
-                        is_scheduled=False,
-                    )
-                )
+            )
 
         except Exception as e:
             print(f"    -> Error: {e}")
