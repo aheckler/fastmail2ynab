@@ -1105,20 +1105,44 @@ def fetch_recent_emails(token: str) -> list[Email]:
         # 3. Preview snippet (last resort)
         body = ""
 
-        # Try text body first - cleanest format
+        # Extract text body content
+        # Note: For HTML-only emails, textBody may contain HTML parts (type="text/html")
+        # In that case, we still need to strip HTML tags
+        text_body = ""
         text_parts = email_data.get("textBody") or []
         for part in text_parts:
             body_value = email_data.get("bodyValues", {}).get(part.get("partId"), {})
             if body_value.get("value"):
-                body += body_value["value"]
+                content = body_value["value"]
+                # Check if this "text" part is actually HTML
+                if part.get("type", "").startswith("text/html"):
+                    content = strip_html(content)
+                text_body += content
 
-        # Fall back to HTML body, stripped of tags
-        if not body:
-            html_parts = email_data.get("htmlBody") or []
-            for part in html_parts:
-                body_value = email_data.get("bodyValues", {}).get(part.get("partId"), {})
-                if body_value.get("value"):
-                    body += strip_html(body_value["value"])
+        # Extract HTML body content (stripped of tags)
+        html_body = ""
+        html_parts = email_data.get("htmlBody") or []
+        for part in html_parts:
+            body_value = email_data.get("bodyValues", {}).get(part.get("partId"), {})
+            if body_value.get("value"):
+                html_body += strip_html(body_value["value"])
+
+        # Decide which body to use
+        # Some emails have a stub text body like "Please enable HTML to view this email"
+        # In those cases, prefer the HTML body which has the actual content
+        stub_phrases = ["enable html", "view this email", "html version", "html-enabled"]
+        text_is_stub = (
+            text_body
+            and len(text_body) < 2000
+            and any(phrase in text_body.lower() for phrase in stub_phrases)
+        )
+
+        if text_body and not text_is_stub:
+            body = text_body
+        elif html_body:
+            body = html_body
+        else:
+            body = text_body  # Use stub if nothing else available
 
         # Last resort: use the preview snippet
         if not body:
