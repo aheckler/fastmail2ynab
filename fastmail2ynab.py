@@ -30,10 +30,6 @@ Usage:
     # Normal run - process recent emails
     uv run fastmail2ynab.py
 
-    # Interactively select which transactions to create
-    # Cancel (Ctrl+C) to preview without marking emails as processed
-    uv run fastmail2ynab.py --confirm
-
     # Force reimport (reprocess all emails, bypass YNAB duplicate detection)
     uv run fastmail2ynab.py --force
 
@@ -1835,7 +1831,7 @@ def select_transactions_interactive(
     return [txn for txn in pending if txn.email_id in selected_ids]
 
 
-def process_emails(force: bool = False, confirm: bool = False):
+def process_emails(force: bool = False):
     """Main entry point: fetch emails, classify, and create YNAB transactions.
 
     Processing flow for each email:
@@ -1847,17 +1843,16 @@ def process_emails(force: bool = False, confirm: bool = False):
     6. Use transaction date from email, or fall back to email received date
     7. Match merchant to existing YNAB payee for consistent naming
     8. Collect pending transactions for batch creation
-    9. (Optional) Show interactive selection if --confirm flag is set
+    9. Show interactive selection UI for user to confirm transactions
     10. Create transactions in YNAB (in batches of 5)
     11. Mark emails as processed in our database
+
+    Cancel (Ctrl+C) during selection to preview without marking emails as processed.
 
     Args:
         force: If True, reprocess all emails even if already in processed_emails,
             and bypass YNAB's import_id deduplication. Use this to reimport
             transactions that were previously deleted from YNAB.
-        confirm: If True, show interactive checkbox selection before creating
-            transactions in YNAB. Cancel (Ctrl+C) to preview without marking
-            emails as processed.
     """
     # Validate all required config is present
     missing = [k for k, v in CONFIG.items() if not v]
@@ -1877,10 +1872,10 @@ def process_emails(force: bool = False, confirm: bool = False):
 
     # Acquire exclusive lock to prevent concurrent execution
     with acquire_lock():
-        _process_emails_impl(force=force, confirm=confirm)
+        _process_emails_impl(force=force)
 
 
-def _process_emails_impl(force: bool, confirm: bool):
+def _process_emails_impl(force: bool):
     """Internal implementation of process_emails (called with lock held)."""
     if force:
         print("*** FORCE MODE: Will bypass YNAB duplicate detection ***")
@@ -2045,40 +2040,40 @@ def _process_emails_impl(force: bool, confirm: bool):
             print(f"    -> {traceback.format_exc()}")
             errors += 1
 
-    # Interactive selection if --confirm flag is set
-    if confirm and pending_transactions:
+    # Mark non-receipt emails as processed
+    for email_id in non_receipt_emails:
+        mark_processed(email_id, is_receipt=False, run_id=run_id)
+
+    # Interactive selection of transactions
+    if not pending_transactions:
         print()
-        original_pending = pending_transactions.copy()
-        result = select_transactions_interactive(pending_transactions, transaction_display_data)
+        print("No transactions to review.")
+        return
 
-        if result is None:
-            # User cancelled with Ctrl+C - don't mark anything as processed (preview mode)
-            print("Cancelled. No emails marked as processed.")
-            return
+    print()
+    original_pending = pending_transactions.copy()
+    result = select_transactions_interactive(pending_transactions, transaction_display_data)
 
-        pending_transactions = result
+    if result is None:
+        # User cancelled with Ctrl+C - don't mark anything as processed (preview mode)
+        print("Cancelled. No emails marked as processed.")
+        return
 
-        # Mark non-receipt emails as processed (user confirmed)
-        for email_id in non_receipt_emails:
-            mark_processed(email_id, is_receipt=False, run_id=run_id)
+    pending_transactions = result
 
-        # Mark skipped transactions as processed (user explicitly confirmed)
-        selected_ids = {txn.email_id for txn in pending_transactions}
-        skipped_count = 0
-        for txn in original_pending:
-            if txn.email_id not in selected_ids:
-                mark_processed(txn.email_id, is_receipt=True, ynab_id=None, run_id=run_id)
-                skipped_count += 1
-        if skipped_count:
-            print(f"Marked {skipped_count} skipped transaction(s) as processed.")
+    # Mark skipped transactions as processed (user explicitly confirmed)
+    selected_ids = {txn.email_id for txn in pending_transactions}
+    skipped_count = 0
+    for txn in original_pending:
+        if txn.email_id not in selected_ids:
+            mark_processed(txn.email_id, is_receipt=True, ynab_id=None, run_id=run_id)
+            skipped_count += 1
+    if skipped_count:
+        print(f"Marked {skipped_count} skipped transaction(s) as processed.")
 
-        if not pending_transactions:
-            print("No transactions selected. Marked skipped emails as processed.")
-            return
-    else:
-        # No --confirm or no pending transactions - mark non-receipts as processed
-        for email_id in non_receipt_emails:
-            mark_processed(email_id, is_receipt=False, run_id=run_id)
+    if not pending_transactions:
+        print("No transactions selected. Marked skipped emails as processed.")
+        return
 
     # Split into scheduled and regular transactions
     scheduled_transactions = [t for t in pending_transactions if t.is_scheduled]
@@ -2292,14 +2287,6 @@ if __name__ == "__main__":
             "and removing the processed email records."
         ),
     )
-    parser.add_argument(
-        "--confirm",
-        action="store_true",
-        help=(
-            "Interactively select which transactions to create. "
-            "Cancel (Ctrl+C) to preview without marking emails as processed."
-        ),
-    )
     args = parser.parse_args()
 
     # Handle --undo: undo the last run and exit
@@ -2309,8 +2296,6 @@ if __name__ == "__main__":
             other_flags.append("--force")
         if args.clear_cache:
             other_flags.append("--clear-cache")
-        if args.confirm:
-            other_flags.append("--confirm")
         if other_flags:
             print(f"Warning: {', '.join(other_flags)} ignored when using --undo")
             print()
@@ -2326,4 +2311,4 @@ if __name__ == "__main__":
         print("Cache cleared.")
         print()
 
-    process_emails(force=args.force, confirm=args.confirm)
+    process_emails(force=args.force)

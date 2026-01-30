@@ -91,17 +91,13 @@ Dependencies are declared inline in the script using PEP 723, so uv handles them
 | `--force` | Reprocess all emails and bypass YNAB's duplicate detection. Use to reimport transactions deleted from YNAB. |
 | `--clear-cache` | Clear Claude's classification cache and re-analyze all emails. Useful if you've updated scoring criteria. |
 | `--undo` | Undo the most recent run by deleting its transactions from YNAB and removing processed email records. |
-| `--confirm` | Interactively select which transactions to create. Cancel (Ctrl+C) to preview without marking emails as processed. |
 
 Examples:
 
 ```bash
-# Normal run
+# Normal run - interactively select transactions to create
+# Use Ctrl+C during selection to preview without marking emails as processed
 uv run fastmail2ynab.py
-
-# Interactively select which transactions to create
-# Use Ctrl+C to cancel and preview without marking emails as processed
-uv run fastmail2ynab.py --confirm
 
 # Reimport transactions deleted from YNAB
 uv run fastmail2ynab.py --force
@@ -273,6 +269,6 @@ This ensures transactions use your existing payee names for consistent categoriz
 - This also removes the processed email records so they can be reprocessed
 
 **Want to preview before importing**
-- Use `--confirm` and press Ctrl+C during selection to preview
-- Classifications are cached, so the real run won't re-call Claude
+- Press Ctrl+C during transaction selection to preview without importing
+- Classifications are cached, so re-running won't call Claude again
 - Emails won't be marked as processed, so they'll reappear on the next run
