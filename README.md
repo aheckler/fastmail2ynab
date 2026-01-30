@@ -172,7 +172,7 @@ Claude also determines whether each transaction is:
 
 This is reflected correctly in YNAB—outflows show as negative amounts, inflows as positive.
 
-Each imported transaction includes a memo in the format: `fm2ynab | Run: abc12345`
+Each imported transaction includes the memo: `Imported by fastmail2ynab`
 
 ## Multi-Account Routing
 
@@ -203,7 +203,7 @@ All data is stored in `processed_emails.db` (SQLite) with five tables:
 | `classification_cache` | Caches Claude's analysis to avoid redundant API calls |
 | `ynab_payees` | Caches YNAB payee list for merchant name matching |
 | `ynab_sync_state` | Stores sync metadata for efficient delta updates |
-| `runs` | Tracks script executions (run_id appears in transaction memos) |
+| `runs` | Tracks script executions |
 
 Delete this file to start fresh and reprocess all emails.
 

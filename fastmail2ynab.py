@@ -1922,7 +1922,7 @@ def _process_emails_impl(force: bool):
                 )
 
             # Build memo with metadata for reference in YNAB
-            memo = f"fm2ynab | Run: {run_id[:8]}"
+            memo = "Imported by fastmail2ynab"
 
             # Store display data for summary table (use original date for display)
             transaction_display_data[email.id] = (
