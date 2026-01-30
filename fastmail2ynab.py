@@ -1221,14 +1221,14 @@ ACCOUNTS (for routing):
 ---
 
 Score this email from 1-10 on how confident you are that money HAS MOVED or IS SCHEDULED TO MOVE:
-- 1-3: Not financial (newsletters, marketing, shipping updates without prices)
+- 1-3: Not financial (newsletters, marketing, shipping updates without prices, credits to store balances or gift card balances)
 - 4-5: Financially related but no transaction occurred (expiration notices, renewal reminders, price change notices, payment method alerts)
 - 6-7: Probably a transaction but missing key details
 - 8-10: Confirmed transaction - receipt, charge confirmation, payment confirmation, or autopay bill with specific due date
 
 Also determine if this is:
 - OUTFLOW: Money I spent (purchases, subscriptions, bills, fees, charges)
-- INFLOW: Money I received (refunds, credits, rebates, cashback, deposits, payments to me)
+- INFLOW: Money returned to my actual payment method (refunds to credit card, refunds to bank account, cashback deposits). NOT store credit, account balances, or gift card balances - those don't track in YNAB.
 
 Respond with JSON in this exact format:
 {{
