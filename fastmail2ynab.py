@@ -375,6 +375,7 @@ class ClassificationResult:
     description: str | None = None
     reasoning: str | None = None
     account_name: str | None = None
+    checklist: dict[str, bool] | None = None
 
 
 @dataclass
@@ -593,6 +594,7 @@ def init_db():
         ensure_column("classification_cache", "matched_payee")
         ensure_column("classification_cache", "account_name")
         ensure_column("classification_cache", "date_confidence")
+        ensure_column("classification_cache", "checklist_json")
 
         # Table 3: Cache YNAB payees for name matching
         # Reduces API calls by caching payee list with delta updates
@@ -642,7 +644,7 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """SELECT score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name, date_confidence
+            """SELECT score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name, date_confidence, checklist_json
                FROM classification_cache WHERE email_id = ?""",
             (email_id,),
         )
@@ -650,6 +652,14 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
 
     if row is None:
         return None
+
+    # Parse checklist JSON if present
+    checklist = None
+    if row[11]:
+        try:
+            checklist = json.loads(row[11])
+        except json.JSONDecodeError:
+            pass
 
     return ClassificationResult(
         score=row[0],
@@ -663,6 +673,7 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
         reasoning=row[8],
         account_name=row[9],
         date_confidence=row[10],
+        checklist=checklist,
     )
 
 
@@ -675,12 +686,15 @@ def cache_classification(email_id: str, result: ClassificationResult):
         email_id: Fastmail's unique email identifier.
         result: The classification result from Claude.
     """
+    # Serialize checklist to JSON if present
+    checklist_json = json.dumps(result.checklist) if result.checklist else None
+
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
             """INSERT OR REPLACE INTO classification_cache
-               (email_id, classified_at, score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name, date_confidence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (email_id, classified_at, score, is_inflow, merchant, matched_payee, amount, currency, date, description, reasoning, account_name, date_confidence, checklist_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 email_id,
                 datetime.now(UTC).isoformat(),
@@ -695,6 +709,7 @@ def cache_classification(email_id: str, result: ClassificationResult):
                 result.reasoning,
                 result.account_name,
                 result.date_confidence,
+                checklist_json,
             ),
         )
         conn.commit()
@@ -1198,8 +1213,7 @@ def classify_email(
             account_lines.extend(f"  {line}" for line in acct.notes.splitlines())
     accounts_text = "\n".join(account_lines) if account_lines else "(no accounts configured)"
 
-    # Structured prompt asking for JSON output
-    # Includes scoring rubric and field definitions
+    # Structured prompt asking for JSON output with explicit checklist
     prompt = f"""Analyze this email and determine if it's related to a financial transaction.
 
 FROM: {email.from_email}
@@ -1220,18 +1234,50 @@ ACCOUNTS (for routing):
 
 ---
 
-Score this email from 1-10 on how confident you are that money HAS MOVED or IS SCHEDULED TO MOVE:
-- 1-3: Not financial (newsletters, marketing, shipping updates without prices, credits to store balances or gift card balances)
-- 4-5: Financially related but no transaction occurred (expiration notices, renewal reminders, price change notices, payment method alerts)
-- 6-7: Probably a transaction but missing key details
-- 8-10: Confirmed transaction - receipt, charge confirmation, payment confirmation, or autopay bill with specific due date
+## CLASSIFICATION CHECKLIST
 
-Also determine if this is:
+Answer YES or NO for each criterion:
+
+**Positive signals (reasons TO import):**
+1. `specific_amount` - Contains a specific dollar amount
+2. `transaction_date` - Contains a transaction/purchase/payment date
+3. `merchant_identified` - Names a merchant or payee
+4. `payment_method` - References a real payment method (card, bank, PayPal)
+5. `confirmation_language` - Uses confirmation language ("charged", "paid", "refunded")
+6. `account_match` - Mentions one of the user's configured financial accounts
+
+**Negative signals (reasons NOT to import):**
+7. `balance_credit` - Credits to store balance, gift card, rewards points (not real money)
+8. `shipping_only` - Shipping/delivery notification without a charge
+9. `reminder_only` - Reminder, alert, or notice (not a confirmation)
+10. `marketing` - Marketing or promotional content
+
+## SCORING BASED ON CHECKLIST
+
+- **Score 8-10**: Multiple positive signals (amount + merchant + confirmation language), no negative signals
+- **Score 6-7**: Some positive signals but missing key details (e.g., amount without confirmation)
+- **Score 4-5**: Financially related but has negative signals (reminder_only, balance_credit)
+- **Score 1-3**: No positive signals OR strong negative signals (marketing, shipping_only)
+
+## DIRECTION
+
 - OUTFLOW: Money I spent (purchases, subscriptions, bills, fees, charges)
-- INFLOW: Money returned to my actual payment method (refunds to credit card, refunds to bank account, cashback deposits). NOT store credit, account balances, or gift card balances - those don't track in YNAB.
+- INFLOW: Money returned to my actual payment method (refunds to credit card, refunds to bank account, cashback deposits). NOT store credit, account balances, or gift card balances.
 
 Respond with JSON in this exact format:
 {{
+  "checklist": {{
+    "specific_amount": true,
+    "transaction_date": true,
+    "merchant_identified": true,
+    "payment_method": true,
+    "confirmation_language": true,
+    "account_match": false,
+    "balance_credit": false,
+    "shipping_only": false,
+    "reminder_only": false,
+    "marketing": false
+  }},
   "score": 8,
   "direction": "outflow",
   "merchant": "Store Name or Source",
@@ -1242,11 +1288,12 @@ Respond with JSON in this exact format:
   "date": "2024-01-15",
   "date_confidence": "certain",
   "description": "Brief description of transaction",
-  "reasoning": "Why you gave this score and direction"
+  "reasoning": "Why you gave this score based on the checklist"
 }}
 
 Rules:
-- "score" must be an integer from 1-10
+- "checklist" must contain all 10 boolean fields
+- "score" must be an integer from 1-10, derived from the checklist as described above
 - "direction" must be either "inflow" or "outflow"
 - "amount" must be a positive number (no currency symbols), or null if not found
 - "date" must be YYYY-MM-DD format. For purchase receipts, use the purchase date. For bills with autopay, use the due date (when payment will be charged). For payment confirmations, use the payment date. Use null if not found.
@@ -1259,9 +1306,6 @@ Rules:
 - "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "Co.", etc. Only use a value from the provided list.
 - "account_name" should be the EXACT name from the ACCOUNTS list that this transaction belongs to based on the account descriptions. Use null to route to the default account. Only use a value from the provided list.
 - "description" should briefly describe the transaction
-
-Examples of OUTFLOW: purchase receipts, subscription charges, bill payments, fees
-Examples of INFLOW: refund confirmations, credit applied, cashback earned, payment received, reimbursement
 
 Respond ONLY with valid JSON, no other text."""
 
@@ -1290,6 +1334,15 @@ Respond ONLY with valid JSON, no other text."""
     # Convert parsed JSON to ClassificationResult
     try:
         direction = (data.get("direction") or "outflow").lower()
+
+        # Extract and validate checklist
+        checklist = data.get("checklist")
+        if checklist and isinstance(checklist, dict):
+            # Ensure all values are booleans
+            checklist = {k: bool(v) for k, v in checklist.items()}
+        else:
+            checklist = None
+
         return ClassificationResult(
             score=int(data.get("score", 0)),
             is_inflow=(direction == "inflow"),
@@ -1302,6 +1355,7 @@ Respond ONLY with valid JSON, no other text."""
             description=data.get("description"),
             reasoning=data.get("reasoning"),
             account_name=data.get("account_name"),
+            checklist=checklist,
         )
 
     except (KeyError, ValueError) as e:
