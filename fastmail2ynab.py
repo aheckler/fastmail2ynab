@@ -33,9 +33,6 @@ Usage:
     # Force reimport (reprocess all emails, bypass YNAB duplicate detection)
     uv run fastmail2ynab.py --force
 
-    # Clear Claude's classification cache and re-analyze everything
-    uv run fastmail2ynab.py --clear-cache
-
 Environment Variables (in .env file):
     FASTMAIL_TOKEN         - Fastmail API token with mail read access
     ANTHROPIC_API_KEY      - Claude API key
@@ -2118,24 +2115,6 @@ if __name__ == "__main__":
             "Use this to reimport transactions that were deleted from YNAB."
         ),
     )
-    parser.add_argument(
-        "--clear-cache",
-        action="store_true",
-        help=(
-            "Clear Claude's classification cache before running. Forces "
-            "re-analysis of all emails (useful if you've updated the prompt "
-            "or want fresh classifications)."
-        ),
-    )
     args = parser.parse_args()
-
-    # Handle --clear-cache: drop the classification_cache table
-    if args.clear_cache:
-        print("Clearing classification cache...")
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("DROP TABLE IF EXISTS classification_cache")
-            conn.commit()
-        print("Cache cleared.")
-        print()
 
     process_emails(force=args.force)

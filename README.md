@@ -89,7 +89,6 @@ Dependencies are declared inline in the script using PEP 723, so uv handles them
 | Flag | Description |
 |------|-------------|
 | `--force` | Reprocess all emails and bypass YNAB's duplicate detection. Use to reimport transactions deleted from YNAB. |
-| `--clear-cache` | Clear Claude's classification cache and re-analyze all emails. Useful if you've updated scoring criteria. |
 
 Examples:
 
@@ -100,9 +99,6 @@ uv run fastmail2ynab.py
 
 # Reimport transactions deleted from YNAB
 uv run fastmail2ynab.py --force
-
-# Re-analyze all emails with fresh Claude classifications
-uv run fastmail2ynab.py --clear-cache
 ```
 
 ## Scheduling
@@ -251,14 +247,11 @@ This ensures transactions use your existing payee names for consistent categoriz
 
 **Payee names not matching**
 - Payee cache refreshes every 24 hours automatically using delta updates
-- Use `--clear-cache` to re-classify emails if you've added new payees to YNAB
+- New payees will be matched on future emails automatically
 
 **Transactions going to wrong account**
 - Improve account descriptions in `.env.notes`
-- Use `--clear-cache` to re-classify emails with updated descriptions
-
-**Want to re-analyze emails with Claude**
-- Use `--clear-cache` to clear classifications and re-analyze all emails
+- Future emails will use the updated descriptions
 
 **Want to preview before importing**
 - Press Ctrl+C during transaction selection to preview without importing
