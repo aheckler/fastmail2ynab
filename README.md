@@ -90,7 +90,6 @@ Dependencies are declared inline in the script using PEP 723, so uv handles them
 |------|-------------|
 | `--force` | Reprocess all emails and bypass YNAB's duplicate detection. Use to reimport transactions deleted from YNAB. |
 | `--clear-cache` | Clear Claude's classification cache and re-analyze all emails. Useful if you've updated scoring criteria. |
-| `--undo` | Undo the most recent run by deleting its transactions from YNAB and removing processed email records. |
 
 Examples:
 
@@ -104,9 +103,6 @@ uv run fastmail2ynab.py --force
 
 # Re-analyze all emails with fresh Claude classifications
 uv run fastmail2ynab.py --clear-cache
-
-# Undo the last run (delete transactions from YNAB)
-uv run fastmail2ynab.py --undo
 ```
 
 ## Scheduling
@@ -211,7 +207,7 @@ All data is stored in `processed_emails.db` (SQLite) with five tables:
 | `classification_cache` | Caches Claude's analysis to avoid redundant API calls |
 | `ynab_payees` | Caches YNAB payee list for merchant name matching |
 | `ynab_sync_state` | Stores sync metadata for efficient delta updates |
-| `runs` | Tracks script executions for undo functionality |
+| `runs` | Tracks script executions (run_id appears in transaction memos) |
 
 Delete this file to start fresh and reprocess all emails.
 
@@ -263,10 +259,6 @@ This ensures transactions use your existing payee names for consistent categoriz
 
 **Want to re-analyze emails with Claude**
 - Use `--clear-cache` to clear classifications and re-analyze all emails
-
-**Made a mistake and want to undo**
-- Use `--undo` to delete all transactions from the most recent run
-- This also removes the processed email records so they can be reprocessed
 
 **Want to preview before importing**
 - Press Ctrl+C during transaction selection to preview without importing

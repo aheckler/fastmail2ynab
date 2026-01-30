@@ -36,9 +36,6 @@ Usage:
     # Clear Claude's classification cache and re-analyze everything
     uv run fastmail2ynab.py --clear-cache
 
-    # Undo the most recent run (delete transactions from YNAB)
-    uv run fastmail2ynab.py --undo
-
 Environment Variables (in .env file):
     FASTMAIL_TOKEN         - Fastmail API token with mail read access
     ANTHROPIC_API_KEY      - Claude API key
@@ -812,55 +809,6 @@ def complete_run(run_id: str, transactions_created: int):
         conn.commit()
 
 
-def get_last_run() -> tuple[str, int] | None:
-    """Get the most recent completed run.
-
-    Returns:
-        Tuple of (run_id, transactions_created) or None if no runs exist.
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """SELECT run_id, transactions_created FROM runs
-               WHERE completed_at IS NOT NULL
-               ORDER BY completed_at DESC LIMIT 1"""
-        )
-        row = cursor.fetchone()
-    return (row[0], row[1]) if row else None
-
-
-def get_transactions_for_run(run_id: str) -> list[tuple[str, str]]:
-    """Get all transactions created in a specific run.
-
-    Args:
-        run_id: The run ID to query.
-
-    Returns:
-        List of (email_id, ynab_transaction_id) tuples.
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """SELECT email_id, ynab_transaction_id FROM processed_emails
-               WHERE run_id = ? AND ynab_transaction_id IS NOT NULL""",
-            (run_id,),
-        )
-        return cursor.fetchall()
-
-
-def delete_run_records(run_id: str):
-    """Delete all records associated with a run.
-
-    Args:
-        run_id: The run ID to delete.
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM processed_emails WHERE run_id = ?", (run_id,))
-        cursor.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
-        conn.commit()
-
-
 # =============================================================================
 # Account Routing
 # =============================================================================
@@ -1614,33 +1562,6 @@ def create_ynab_scheduled_transaction(
     return response.json()["data"]["scheduled_transaction"]["id"]
 
 
-def delete_ynab_transaction(token: str, budget_id: str, transaction_id: str) -> bool:
-    """Delete a transaction from YNAB.
-
-    Args:
-        token: YNAB personal access token.
-        budget_id: Target budget UUID.
-        transaction_id: The transaction ID to delete.
-
-    Returns:
-        True if deleted successfully, False if not found.
-
-    Raises:
-        requests.HTTPError: If the API request fails (except 404).
-    """
-    response = requests.delete(
-        f"{YNAB_BASE_URL}/budgets/{budget_id}/transactions/{transaction_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
-    )
-
-    if response.status_code == 404:
-        return False
-
-    response.raise_for_status()
-    return True
-
-
 def fetch_ynab_payees(token: str, budget_id: str) -> tuple[list[dict], int]:
     """Fetch all payees from YNAB, using delta updates if possible.
 
@@ -2179,79 +2100,6 @@ def _process_emails_impl(force: bool):
     )
 
 
-def undo_last_run():
-    """Undo the most recent script run by deleting its transactions from YNAB.
-
-    This function:
-    1. Finds the most recent completed run
-    2. Gets all transactions created in that run
-    3. Deletes each transaction from YNAB
-    4. Removes the processed_emails and run records
-    """
-    # Validate required config
-    if not CONFIG["ynab_token"] or not CONFIG["ynab_budget_id"]:
-        print("Error: Missing YNAB configuration")
-        return
-
-    # Acquire exclusive lock to prevent concurrent execution
-    with acquire_lock():
-        _undo_last_run_impl()
-
-
-def _undo_last_run_impl():
-    """Internal implementation of undo_last_run (called with lock held)."""
-    init_db()
-
-    last_run = get_last_run()
-    if not last_run:
-        print("No runs found to undo.")
-        return
-
-    run_id, transaction_count = last_run
-    print(f"Found last run: {run_id}")
-    print(f"Transactions created: {transaction_count}")
-
-    transactions = get_transactions_for_run(run_id)
-    if not transactions:
-        print("No transactions found for this run.")
-        delete_run_records(run_id)
-        print("Cleaned up run records.")
-        return
-
-    print(f"Deleting {len(transactions)} transactions from YNAB...")
-
-    deleted = 0
-    not_found = 0
-    errors = 0
-
-    for _, ynab_id in transactions:
-        if not ynab_id:
-            not_found += 1
-            continue
-
-        try:
-            success = delete_ynab_transaction(
-                CONFIG["ynab_token"],
-                CONFIG["ynab_budget_id"],
-                ynab_id,
-            )
-            if success:
-                print(f"  Deleted: {ynab_id}")
-                deleted += 1
-            else:
-                print(f"  Not found (already deleted?): {ynab_id}")
-                not_found += 1
-        except Exception as e:
-            print(f"  Error deleting {ynab_id}: {e}")
-            errors += 1
-
-    # Clean up database records
-    delete_run_records(run_id)
-
-    print()
-    print(f"Undo complete! {deleted} deleted, {not_found} not found, {errors} errors")
-
-
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
@@ -2279,28 +2127,7 @@ if __name__ == "__main__":
             "or want fresh classifications)."
         ),
     )
-    parser.add_argument(
-        "--undo",
-        action="store_true",
-        help=(
-            "Undo the most recent run by deleting its transactions from YNAB "
-            "and removing the processed email records."
-        ),
-    )
     args = parser.parse_args()
-
-    # Handle --undo: undo the last run and exit
-    if args.undo:
-        other_flags = []
-        if args.force:
-            other_flags.append("--force")
-        if args.clear_cache:
-            other_flags.append("--clear-cache")
-        if other_flags:
-            print(f"Warning: {', '.join(other_flags)} ignored when using --undo")
-            print()
-        undo_last_run()
-        exit(0)
 
     # Handle --clear-cache: drop the classification_cache table
     if args.clear_cache:

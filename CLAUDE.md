@@ -30,7 +30,6 @@ Dependencies are declared inline using PEP 723 script metadata, so uv handles th
 |------|-------------|
 | `--force` | Reprocess all emails and bypass YNAB's duplicate detection. Use to reimport transactions deleted from YNAB. |
 | `--clear-cache` | Clear Claude's classification cache before running. Forces re-analysis of all emails. Useful after prompt changes. |
-| `--undo` | Undo the most recent run by deleting its transactions from YNAB and removing processed email records. |
 
 Flags can be combined: `uv run fastmail2ynab.py --force --clear-cache`
 
@@ -57,7 +56,7 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
 5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`
 6. **Scheduled transactions**: Future dates (like autopay due dates) with "certain" confidence use YNAB's scheduled transactions API; others are capped to today
-7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata), `runs` (script execution history for undo)
+7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata), `runs` (script execution history)
 
 ## Key Data Structures
 
