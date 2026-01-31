@@ -531,7 +531,7 @@ def strip_html(html: str) -> str:
 # 2. classification_cache - Stores Claude's analysis results
 #    - Avoids redundant API calls for previously analyzed emails
 #    - Useful when re-running after clearing processed_emails
-#    - Can be cleared with --clear-cache flag
+#    - Parse failures are not cached to allow retry on next run
 # =============================================================================
 
 
@@ -573,7 +573,7 @@ def init_db():
         # This avoids paying for repeat API calls when:
         # - Re-running the script after clearing processed_emails
         # - Adjusting min_score threshold and re-evaluating
-        # Can be cleared with --clear-cache to force re-analysis
+        # Parse failures are not cached to allow retry on next run
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS classification_cache (
                 email_id TEXT PRIMARY KEY,
@@ -1206,8 +1206,9 @@ def classify_email(
     # Format account list for the prompt
     account_lines = []
     for acct in accounts:
-        default_marker = " (DEFAULT)" if acct.default else ""
-        account_lines.append(f"- {acct.name}{default_marker}")
+        account_lines.append(f"- {acct.name}")
+        if acct.default:
+            account_lines.append("  [DEFAULT - use null to route here]")
         if acct.notes:
             # Indent notes under account name
             account_lines.extend(f"  {line}" for line in acct.notes.splitlines())
@@ -1926,7 +1927,9 @@ def _process_emails_impl(force: bool):
             else:
                 # No cache hit - call Claude API and cache the result
                 result = classify_email(email, client, payee_names, ACCOUNTS)
-                cache_classification(email.id, result)
+                # Don't cache parse failures - let them retry next run
+                if not (result.reasoning or "").startswith(("Failed to parse", "Parse error")):
+                    cache_classification(email.id, result)
 
             direction_str = "INFLOW" if result.is_inflow else "OUTFLOW"
             print(

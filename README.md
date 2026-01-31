@@ -6,7 +6,7 @@ A local Python script that automatically detects receipt emails in Fastmail and 
 
 1. Fetches recent emails from your Fastmail inbox via JMAP
 2. Uses Claude to classify each email and extract transaction details (merchant, amount, date, inflow/outflow)
-3. Matches merchant names to existing YNAB payees using fuzzy matching for consistent naming
+3. Matches merchant names to existing YNAB payees using Claude for consistent naming
 4. Routes transactions to the appropriate YNAB account based on AI classification
 5. Creates unapproved transactions in YNAB in batches of 5
 6. Tracks processed emails and run history in a local SQLite database
