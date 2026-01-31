@@ -1252,12 +1252,29 @@ Answer YES or NO for each criterion:
 9. `reminder_only` - Reminder, alert, or notice (not a confirmation)
 10. `marketing` - Marketing or promotional content
 
-## SCORING BASED ON CHECKLIST
+## SCORING FORMULA
 
-- **Score 8-10**: Multiple positive signals (amount + merchant + confirmation language), no negative signals
-- **Score 6-7**: Some positive signals but missing key details (e.g., amount without confirmation)
-- **Score 4-5**: Financially related but has negative signals (reminder_only, balance_credit)
-- **Score 1-3**: No positive signals OR strong negative signals (marketing, shipping_only)
+Calculate the score using these weights:
+
+**Positive signal weights:**
+- `specific_amount`: +3 (core requirement)
+- `confirmation_language`: +3 (distinguishes receipts from notices)
+- `transaction_date`: +2 (strong transaction indicator)
+- `payment_method`: +2 (confirms payment occurred)
+- `merchant_identified`: +1 (helpful but common)
+- `account_match`: +1 (bonus for account routing)
+
+**Negative signal weights:**
+- `marketing`: -5 (never import marketing)
+- `balance_credit`: -4 (not real money movement)
+- `shipping_only`: -2 (has financial data, but not a charge)
+- `reminder_only`: -2 (may have amount, but no transaction yet)
+
+**Calculation:**
+1. Start with base score of 3
+2. Add weights for TRUE positive signals
+3. Subtract weights for TRUE negative signals
+4. Clamp result to range 1-10
 
 ## DIRECTION
 
@@ -1293,7 +1310,7 @@ Respond with JSON in this exact format:
 
 Rules:
 - "checklist" must contain all 10 boolean fields
-- "score" must be an integer from 1-10, derived from the checklist as described above
+- "score" must be an integer from 1-10, calculated using the formula above
 - "direction" must be either "inflow" or "outflow"
 - "amount" must be a positive number (no currency symbols), or null if not found
 - "date" must be YYYY-MM-DD format. For purchase receipts, use the purchase date. For bills with autopay, use the due date (when payment will be charged). For payment confirmations, use the payment date. Use null if not found.

@@ -66,25 +66,34 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 
 Claude uses an explicit checklist to score emails, making classification stable and predictable:
 
-**Positive signals (reasons TO import):**
-1. `specific_amount` - Contains a specific dollar amount
-2. `transaction_date` - Contains a transaction/purchase/payment date
-3. `merchant_identified` - Names a merchant or payee
-4. `payment_method` - References a real payment method (card, bank, PayPal)
-5. `confirmation_language` - Uses confirmation language ("charged", "paid", "refunded")
-6. `account_match` - Mentions one of the user's configured financial accounts
+**Positive signals (weighted):**
+| Signal | Weight | Rationale |
+|--------|--------|-----------|
+| `specific_amount` | +3 | Core requirement for any transaction |
+| `confirmation_language` | +3 | Distinguishes receipts from notices |
+| `transaction_date` | +2 | Strong transaction indicator |
+| `payment_method` | +2 | Confirms payment occurred |
+| `merchant_identified` | +1 | Helpful but common in all emails |
+| `account_match` | +1 | Bonus for account routing |
 
-**Negative signals (reasons NOT to import):**
-7. `balance_credit` - Credits to store balance, gift card, rewards points (not real money)
-8. `shipping_only` - Shipping/delivery notification without a charge
-9. `reminder_only` - Reminder, alert, or notice (not a confirmation)
-10. `marketing` - Marketing or promotional content
+**Negative signals (weighted):**
+| Signal | Weight | Rationale |
+|--------|--------|-----------|
+| `marketing` | -5 | Never import marketing emails |
+| `balance_credit` | -4 | Not real money movement |
+| `shipping_only` | -2 | Financial data present, just not a charge |
+| `reminder_only` | -2 | May have amount, but no transaction yet |
 
-**Score mapping:**
-- 8-10: Multiple positive signals, no negative signals
-- 6-7: Some positive signals but missing key details
-- 4-5: Financially related but has negative signals
-- 1-3: No positive signals OR strong negative signals
+**Score calculation:**
+1. Start with base score of 3
+2. Add positive weights for TRUE signals
+3. Subtract negative weights for TRUE signals
+4. Clamp to range 1-10
+
+**Example scores:**
+- Amazon shipping (amount + merchant + shipping_only): 3 + 3 + 1 - 2 = **5**
+- School notification (merchant + reminder_only): 3 + 1 - 2 = **2**
+- Apple purchase receipt (all positives, no negatives): 3 + 3 + 3 + 2 + 2 + 1 + 1 = **10** (clamped)
 
 ## Configuration
 
