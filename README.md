@@ -101,49 +101,6 @@ uv run fastmail2ynab.py
 uv run fastmail2ynab.py --force
 ```
 
-## Scheduling
-
-Create `~/Library/LaunchAgents/com.user.fastmail2ynab.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.fastmail2ynab</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/opt/homebrew/bin/uv</string>
-        <string>run</string>
-        <string>/path/to/fastmail2ynab/fastmail2ynab.py</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>7200</integer>
-    <key>WorkingDirectory</key>
-    <string>/path/to/fastmail2ynab</string>
-    <key>StandardOutPath</key>
-    <string>/tmp/fastmail2ynab.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/fastmail2ynab.log</string>
-</dict>
-</plist>
-```
-
-Replace `/path/to/fastmail2ynab` with the actual path (e.g., `/Users/adam/Projects/fastmail2ynab`).
-
-Then load it:
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.user.fastmail2ynab.plist
-```
-
-To unload:
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.user.fastmail2ynab.plist
-```
-
 ## Configuration
 
 Edit `.env` to adjust optional settings:

@@ -52,7 +52,6 @@ Account Descriptions (in .env.notes file):
 
 # Standard library
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -60,7 +59,6 @@ import re
 import sqlite3
 import traceback
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
@@ -253,33 +251,6 @@ def _init_accounts():
 # Database path - stored alongside the script for easy backup/inspection
 # Contains: processed_emails (tracking) and classification_cache (AI results)
 DB_PATH = Path(__file__).parent / "processed_emails.db"
-
-# Lock file path - used to prevent concurrent execution
-LOCK_PATH = Path(__file__).parent / ".fastmail2ynab.lock"
-
-
-@contextmanager
-def acquire_lock():
-    """Acquire exclusive lock to prevent concurrent execution.
-
-    Uses OS-level file locking (fcntl.flock) to ensure only one instance
-    of the script runs at a time. The lock is automatically released when
-    the context manager exits.
-
-    Raises:
-        SystemExit: If another instance is already running.
-    """
-    lock_file = LOCK_PATH.open("w")
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock_file.close()
-        raise SystemExit("Another instance is already running. Exiting.") from None
-    try:
-        yield
-    finally:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        lock_file.close()
 
 
 # API endpoint URLs
@@ -1776,13 +1747,13 @@ def refresh_payee_cache_if_needed(token: str, budget_id: str) -> list[str]:
 
 def select_transactions_interactive(
     pending: list[PendingTransaction],
-    display_data: dict[str, tuple[str, str, float, bool, int]],
+    display_data: dict[str, tuple[str, str, float, bool, int, str]],
 ) -> list[PendingTransaction] | None:
     """Show interactive checkbox selection for pending transactions.
 
     Args:
         pending: List of pending transactions to select from.
-        display_data: Dict mapping email_id to (date, payee, amount, is_inflow, score).
+        display_data: Dict mapping email_id to (date, payee, amount, is_inflow, score, account).
 
     Returns:
         List of selected transactions if user confirmed (may be empty).
@@ -1801,9 +1772,9 @@ def select_transactions_interactive(
     # Build choices with transaction details
     choices = []
     for txn in pending:
-        date, payee, amount, is_inflow, score = display_data[txn.email_id]
+        date, payee, amount, is_inflow, score, acct = display_data[txn.email_id]
         sign = "+" if is_inflow else "-"
-        label = f"{date} | {payee[:30]:<30} | {sign}${amount:.2f} (score: {score})"
+        label = f"{date} | {payee[:30]:<30} | {sign}${amount:.2f} | {acct} (score: {score})"
         choices.append(questionary.Choice(title=label, value=txn.email_id, checked=True))
 
     # Show checkbox selection
@@ -1860,9 +1831,7 @@ def process_emails(force: bool = False):
         )
         return
 
-    # Acquire exclusive lock to prevent concurrent execution
-    with acquire_lock():
-        _process_emails_impl(force=force)
+    _process_emails_impl(force=force)
 
 
 def _process_emails_impl(force: bool):
@@ -1904,8 +1873,8 @@ def _process_emails_impl(force: bool):
     pending_transactions: list[PendingTransaction] = []
     # Track non-receipt emails to mark as processed after batch creation
     non_receipt_emails: list[str] = []
-    # Track transaction display data by email_id: (date, payee, amount, is_inflow, score)
-    transaction_display_data: dict[str, tuple[str, str, float, bool, int]] = {}
+    # Track transaction display data by email_id: (date, payee, amount, is_inflow, score, account)
+    transaction_display_data: dict[str, tuple[str, str, float, bool, int, str]] = {}
     # Track which transactions were actually created (not duplicates) by email_id
     created_email_ids: list[str] = []
 
@@ -2005,6 +1974,7 @@ def _process_emails_impl(force: bool):
                 result.amount,
                 result.is_inflow,
                 result.score,
+                account.name,
             )
 
             # Generate import_id for YNAB deduplication (not used for scheduled)
@@ -2150,18 +2120,20 @@ def _process_emails_impl(force: bool):
             print("Transactions created:")
 
             # Calculate column widths
-            max_payee_len = max(len(payee) for _, payee, _, _, _ in display_transactions)
+            max_payee_len = max(len(payee) for _, payee, _, _, _, _ in display_transactions)
             payee_width = max(max_payee_len, 5)  # minimum "Payee" header width
+            max_acct_len = max(len(acct) for _, _, _, _, _, acct in display_transactions)
+            acct_width = max(max_acct_len, 7)  # minimum "Account" header width
 
             # Print header
-            print(f"{'Date':<10}  {'Payee':<{payee_width}}  {'Amount':>9}  {'Score':>5}")
-            print(f"{'-' * 10}  {'-' * payee_width}  {'-' * 9}  {'-' * 5}")
+            print(f"{'Date':<10}  {'Payee':<{payee_width}}  {'Amount':>9}  {'Account':<{acct_width}}  {'Score':>5}")
+            print(f"{'-' * 10}  {'-' * payee_width}  {'-' * 9}  {'-' * acct_width}  {'-' * 5}")
 
             # Print rows
-            for date, payee, amount, is_inflow, score in display_transactions:
+            for date, payee, amount, is_inflow, score, acct in display_transactions:
                 sign = "+" if is_inflow else "-"
                 amount_str = f"{sign}${amount:.2f}"
-                print(f"{date:<10}  {payee:<{payee_width}}  {amount_str:>9}  {score:>5}")
+                print(f"{date:<10}  {payee:<{payee_width}}  {amount_str:>9}  {acct:<{acct_width}}  {score:>5}")
 
     # Print summary statistics
     print()
