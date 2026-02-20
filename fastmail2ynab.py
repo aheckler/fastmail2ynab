@@ -57,8 +57,6 @@ import json
 import os
 import re
 import sqlite3
-import sys
-import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -1137,43 +1135,6 @@ def fetch_recent_emails(token: str) -> list[Email]:
 # =============================================================================
 
 
-def classify_email_with_retry(
-    email: Email,
-    client: anthropic.Anthropic,
-    payee_names: list[str],
-    accounts: list[Account],
-) -> ClassificationResult:
-    """Classify an email, retrying on API outage errors.
-
-    Retries up to 3 times with escalating backoff (20s, 60s) for API outage
-    errors: 529 overloaded, 500 internal server error, and connection failures.
-    The Anthropic SDK also retries internally (2 fast retries with sub-second
-    backoff) before these errors reach us.
-
-    If all attempts fail, aborts the script — there's no point processing
-    remaining emails during an outage.
-    """
-    retry_delays = [20, 60]  # seconds to wait before 2nd and 3rd attempts
-    for attempt in range(3):
-        if attempt > 0:
-            wait = retry_delays[attempt - 1]
-            print(f"    -> Retrying in {wait}s (attempt {attempt + 1}/3)...")
-            time.sleep(wait)
-        try:
-            return classify_email(email, client, payee_names, accounts)
-        except (
-            anthropic.OverloadedError,
-            anthropic.InternalServerError,
-            anthropic.APIConnectionError,
-        ) as e:
-            print(f"    -> API error: {e}")
-    # All 3 attempts failed — API is likely down
-    print("\n    API unavailable after 3 attempts.")
-    print("    Check https://status.claude.com for outage info.")
-    print("    Try running again later.\n")
-    sys.exit(1)
-
-
 def classify_email(
     email: Email,
     client: anthropic.Anthropic,
@@ -1933,10 +1894,8 @@ def _process_emails_impl(force: bool):
                 print("    -> (cached)")
                 cached += 1
             else:
-                # No cache hit - call Claude API (with outage retry) and cache
-                result = classify_email_with_retry(
-                    email, client, payee_names, ACCOUNTS
-                )
+                # No cache hit - call Claude API and cache the result
+                result = classify_email(email, client, payee_names, ACCOUNTS)
                 # Don't cache parse failures - let them retry next run
                 if not (result.reasoning or "").startswith(("Failed to parse", "Parse error")):
                     cache_classification(email.id, result)
