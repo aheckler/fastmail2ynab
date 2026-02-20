@@ -57,6 +57,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -1123,6 +1124,64 @@ def fetch_recent_emails(token: str) -> list[Email]:
 
 
 # =============================================================================
+# API Health Checks
+# =============================================================================
+
+
+def check_api_health(
+    client: anthropic.Anthropic,
+    fastmail_token: str,
+    ynab_token: str,
+    ynab_budget_id: str,
+) -> None:
+    """Verify all three external APIs are reachable before doing real work.
+
+    Makes lightweight requests to Anthropic, Fastmail, and YNAB. If any
+    service is unreachable, prints a helpful message and exits.
+    """
+    print("Checking API connectivity...")
+
+    # Anthropic
+    try:
+        client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    except (
+        anthropic.APIConnectionError,
+        anthropic.InternalServerError,
+        anthropic.OverloadedError,
+    ) as e:
+        print(f"\nAnthropic API is unreachable: {e}")
+        print("Check https://status.anthropic.com for service status.")
+        sys.exit(1)
+
+    # Fastmail
+    try:
+        get_jmap_session(fastmail_token)
+    except requests.RequestException as e:
+        print(f"\nFastmail API is unreachable: {e}")
+        print("Check https://www.fastmailstatus.com for service status.")
+        sys.exit(1)
+
+    # YNAB
+    try:
+        response = requests.get(
+            f"{YNAB_BASE_URL}/budgets/{ynab_budget_id}",
+            headers={"Authorization": f"Bearer {ynab_token}"},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as e:
+        print(f"\nYNAB API is unreachable: {e}")
+        print("Check https://status.ynab.com for service status.")
+        sys.exit(1)
+
+    print("All APIs reachable.")
+
+
+# =============================================================================
 # Claude Classification
 # =============================================================================
 #
@@ -1846,15 +1905,23 @@ def _process_emails_impl(force: bool):
     # Start a new run
     run_id = start_run()
 
+    # Create Anthropic client once (reused for all emails)
+    client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
+
+    # Verify all APIs are reachable before doing real work
+    check_api_health(
+        client,
+        CONFIG["fastmail_token"],
+        CONFIG["ynab_token"],
+        CONFIG["ynab_budget_id"],
+    )
+
     # Refresh YNAB payee cache for matching merchant names
     payee_names = refresh_payee_cache_if_needed(
         CONFIG["ynab_token"],
         CONFIG["ynab_budget_id"],
     )
     print(f"Using {len(payee_names)} cached YNAB payees for matching")
-
-    # Create Anthropic client once (reused for all emails)
-    client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
 
     # Fetch recent emails from Fastmail
     print("Fetching emails from inbox...")
