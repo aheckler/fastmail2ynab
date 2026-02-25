@@ -1393,8 +1393,8 @@ Respond ONLY with valid JSON, no other text."""
         return ClassificationResult(
             score=int(data.get("score", 0)),
             is_inflow=(direction == "inflow"),
-            merchant=data.get("merchant"),
-            matched_payee=data.get("matched_payee"),
+            merchant=data.get("merchant", "").strip() or None,
+            matched_payee=data.get("matched_payee", "").strip() or None,
             amount=float(data["amount"]) if data.get("amount") else None,
             currency=data.get("currency", "USD"),
             date=data.get("date"),
@@ -1748,7 +1748,7 @@ def get_cached_payees() -> list[str]:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM ynab_payees WHERE deleted = 0")
-        return [row[0] for row in cursor.fetchall()]
+        return [row[0].strip() for row in cursor.fetchall()]
 
 
 def is_payee_cache_stale() -> bool:
@@ -1922,6 +1922,16 @@ def _process_emails_impl(force: bool):
     )
     print(f"Using {len(payee_names)} cached YNAB payees for matching")
 
+    # Warn about payees with leading/trailing whitespace in YNAB
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM ynab_payees WHERE deleted = 0")
+        padded = [row[0] for row in cursor.fetchall() if row[0] != row[0].strip()]
+    if padded:
+        print(f"WARNING: {len(padded)} YNAB payee(s) have leading/trailing whitespace:")
+        for name in padded:
+            print(f"    -> {name!r}")
+
     # Fetch recent emails from Fastmail
     print("Fetching emails from inbox...")
     emails = fetch_recent_emails(CONFIG["fastmail_token"])
@@ -2055,7 +2065,7 @@ def _process_emails_impl(force: bool):
                     account_id=account.ynab_id,
                     amount=result.amount,
                     date=transaction_date,
-                    payee_name=final_payee[:50],
+                    payee_name=final_payee.strip()[:50],
                     memo=memo,
                     import_id=import_id,
                     is_inflow=result.is_inflow,
