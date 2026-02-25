@@ -1150,8 +1150,7 @@ def check_api_health(
         )
     except (
         anthropic.APIConnectionError,
-        anthropic.InternalServerError,
-        anthropic.OverloadedError,
+        anthropic.APIStatusError,
     ) as e:
         print(f"\nAnthropic API is unreachable: {e}")
         print("Check https://status.anthropic.com for service status.")
