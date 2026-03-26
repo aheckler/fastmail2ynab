@@ -1,0 +1,3 @@
+- Archive emails in Fastmail after uploading the associated transaction to YNAB
+- AI-based dedupe of transactions after scoring them all, before TUI kicks in
+- File-based logging of each run, so we know what happened in plain language
