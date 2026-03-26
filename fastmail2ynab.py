@@ -217,10 +217,19 @@ def load_accounts(script_dir: Path) -> list["Account"]:
         names = ", ".join(a.name for a in default_accounts)
         raise SystemExit(f"Error: Multiple default accounts: {names}") from None
 
-    # Warn about accounts without notes
-    for acct in accounts:
-        if not acct.notes:
-            log.warning("Account '%s' has no notes in .env.notes", acct.name)
+    # Abort if any account is missing notes — Claude needs them to route transactions
+    missing_notes = [a.name for a in accounts if not a.notes]
+    if missing_notes:
+        names = ", ".join(missing_notes)
+        example = missing_notes[0]
+        raise SystemExit(
+            f"Error: These accounts have no description in .env.notes: {names}\n"
+            f"\n"
+            f"Add entries to .env.notes like:\n"
+            f"\n"
+            f"{example}:\n"
+            f"Description of when this card is used and what emails to expect."
+        ) from None
 
     return accounts
 
