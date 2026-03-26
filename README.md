@@ -150,6 +150,12 @@ For bills with autopay due dates in the future (like "Due Date: Feb 19, 2026"), 
 
 This prevents incorrect future-dated transactions while properly handling autopay bills where the due date is clearly stated.
 
+## Logging
+
+Each run writes a detailed log file to `logs/` with timestamps and debug-level detail (JMAP requests, classification scores, routing decisions). Console output is quieter, showing only milestones, accepted transactions, and the summary.
+
+Log files are named `YYYY-MM-DD_HH-MM-SS.log` and auto-pruned after 90 days.
+
 ## Data storage
 
 All data is stored in `processed_emails.db` (SQLite) with five tables:

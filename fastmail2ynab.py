@@ -25,6 +25,7 @@ The workflow:
     - Create an unapproved transaction in YNAB (or scheduled transaction for
       future-dated bills with high confidence)
     - Track processed emails in SQLite to avoid duplicates
+    - Write detailed logs to logs/ directory (auto-pruned after 90 days)
 
 Usage:
     # Normal run - process recent emails
@@ -54,6 +55,7 @@ Account Descriptions (in .env.notes file):
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -218,7 +220,7 @@ def load_accounts(script_dir: Path) -> list["Account"]:
     # Warn about accounts without notes
     for acct in accounts:
         if not acct.notes:
-            print(f"Warning: Account '{acct.name}' has no notes in .env.notes")
+            log.warning("Account '%s' has no notes in .env.notes", acct.name)
 
     return accounts
 
@@ -257,6 +259,103 @@ DB_PATH = Path(__file__).parent / "processed_emails.db"
 # API endpoint URLs
 FASTMAIL_JMAP_URL = "https://api.fastmail.com/jmap/session"  # JMAP session endpoint
 YNAB_BASE_URL = "https://api.ynab.com/v1"  # YNAB REST API base
+
+# Log directory
+LOG_DIR = Path(__file__).parent / "logs"
+
+# Log retention in days
+LOG_RETENTION_DAYS = 90
+
+# Module-level logger
+log = logging.getLogger("fastmail2ynab")
+
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+
+class _ConsoleFilter(logging.Filter):
+    """Filter that suppresses log records tagged with console=False."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return getattr(record, "console", True)
+
+
+def prune_old_logs() -> int:
+    """Delete log files older than LOG_RETENTION_DAYS.
+
+    Parses timestamps from filenames (YYYY-MM-DD_HH-MM-SS.log) rather
+    than relying on filesystem mtime for reliability.
+
+    Returns:
+        Number of log files deleted.
+    """
+    if not LOG_DIR.exists():
+        return 0
+
+    cutoff = datetime.now(UTC) - timedelta(days=LOG_RETENTION_DAYS)
+    pruned = 0
+
+    for log_file in LOG_DIR.glob("*.log"):
+        try:
+            # Parse timestamp from filename: YYYY-MM-DD_HH-MM-SS.log
+            ts = datetime.strptime(log_file.stem, "%Y-%m-%d_%H-%M-%S").replace(tzinfo=UTC)
+            if ts < cutoff:
+                log_file.unlink()
+                pruned += 1
+        except ValueError:
+            continue  # Skip files that don't match our naming pattern
+
+    return pruned
+
+
+def setup_logging(run_id: str) -> Path:
+    """Configure file and console logging for this run.
+
+    Creates a log file in LOG_DIR with DEBUG-level detail. Console output
+    goes to stderr at INFO level with a filter that suppresses lines
+    tagged with console=False.
+
+    Args:
+        run_id: The unique run ID to include in the log header.
+
+    Returns:
+        Path to the log file for this run.
+    """
+    LOG_DIR.mkdir(exist_ok=True)
+
+    # Prune old logs before starting
+    pruned = prune_old_logs()
+
+    # Generate log filename from current timestamp
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = LOG_DIR / f"{timestamp}.log"
+
+    # Configure the module logger
+    log.setLevel(logging.DEBUG)
+
+    # File handler: everything (DEBUG+), with timestamps
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)-5s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    log.addHandler(file_handler)
+
+    # Console handler: INFO+ to stderr, no timestamps, with console filter
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+    console_handler.addFilter(_ConsoleFilter())
+    log.addHandler(console_handler)
+
+    # Log run start and pruning info
+    log.info("=== Run %s started ===", run_id)
+    if pruned:
+        log.debug("Pruned %d old log file(s)", pruned)
+
+    return log_path
 
 
 # =============================================================================
@@ -873,7 +972,7 @@ def get_jmap_session(token: str) -> dict:
     Raises:
         requests.HTTPError: If authentication fails.
     """
-    print("  [DEBUG] Connecting to Fastmail JMAP...")
+    log.debug("Connecting to Fastmail JMAP...")
     response = requests.get(
         FASTMAIL_JMAP_URL,
         headers={"Authorization": f"Bearer {token}"},
@@ -881,9 +980,10 @@ def get_jmap_session(token: str) -> dict:
     )
     response.raise_for_status()
     session = response.json()
-    print(f"  [DEBUG] API URL: {session.get('apiUrl')}")
-    print(
-        f"  [DEBUG] Account ID: {session.get('primaryAccounts', {}).get('urn:ietf:params:jmap:mail')}"
+    log.debug("API URL: %s", session.get("apiUrl"))
+    log.debug(
+        "Account ID: %s",
+        session.get("primaryAccounts", {}).get("urn:ietf:params:jmap:mail"),
     )
     return session
 
@@ -921,8 +1021,8 @@ def jmap_request(api_url: str, token: str, method_calls: list, debug_label: str 
     )
 
     if not response.ok:
-        print(f"  [DEBUG] JMAP request failed: {response.status_code}")
-        print(f"  [DEBUG] Response: {response.text[:500]}")
+        log.debug("JMAP request failed: %d", response.status_code)
+        log.debug("Response: %s", response.text[:500])
     response.raise_for_status()
 
     result = response.json()
@@ -930,7 +1030,7 @@ def jmap_request(api_url: str, token: str, method_calls: list, debug_label: str 
     # Check for JMAP-level errors (separate from HTTP errors)
     for method_response in result.get("methodResponses", []):
         if method_response[0] == "error":
-            print(f"  [DEBUG] JMAP error in {debug_label}: {method_response[1]}")
+            log.debug("JMAP error in %s: %s", debug_label, method_response[1])
 
     return result
 
@@ -973,11 +1073,11 @@ def fetch_recent_emails(token: str) -> list[Email]:
 
     mailbox_result = mailbox_response["methodResponses"][0][1]
     inbox_ids = mailbox_result.get("ids", [])
-    print(f"  [DEBUG] Mailbox query returned {len(inbox_ids)} results: {inbox_ids}")
+    log.debug("Mailbox query returned %d results: %s", len(inbox_ids), inbox_ids)
 
     if not inbox_ids:
         # Debugging: list all mailboxes if Inbox not found
-        print("  [DEBUG] No Inbox found, listing all mailboxes...")
+        log.debug("No Inbox found, listing all mailboxes...")
         all_mailboxes = jmap_request(
             api_url,
             token,
@@ -986,11 +1086,11 @@ def fetch_recent_emails(token: str) -> list[Email]:
         )
         mailboxes = all_mailboxes["methodResponses"][0][1].get("list", [])
         for mb in mailboxes:
-            print(f"    - {mb.get('name')} (role: {mb.get('role')}, id: {mb.get('id')})")
+            log.debug("  - %s (role: %s, id: %s)", mb.get("name"), mb.get("role"), mb.get("id"))
         raise ValueError("Could not find Inbox - see mailbox list above")
 
     inbox_id = inbox_ids[0]
-    print(f"  [DEBUG] Using Inbox ID: {inbox_id}")
+    log.debug("Using Inbox ID: %s", inbox_id)
 
     # Step 3a: Query for email IDs in the Inbox
     # Note: No date filter here - Fastmail doesn't support it in queries
@@ -1017,7 +1117,7 @@ def fetch_recent_emails(token: str) -> list[Email]:
 
     query_result = query_response["methodResponses"][0][1]
     email_ids = query_result.get("ids", [])
-    print(f"  [DEBUG] Email query returned {len(email_ids)} IDs")
+    log.debug("Email query returned %d IDs", len(email_ids))
 
     if not email_ids:
         return []
@@ -1119,7 +1219,7 @@ def fetch_recent_emails(token: str) -> list[Email]:
             )
         )
 
-    print(f"  [DEBUG] Fetched {len(emails)} emails")
+    log.debug("Fetched %d emails", len(emails))
     return emails
 
 
@@ -1139,7 +1239,7 @@ def check_api_health(
     Makes lightweight requests to Anthropic, Fastmail, and YNAB. If any
     service is unreachable, prints a helpful message and exits.
     """
-    print("Checking API connectivity...")
+    log.info("Checking API connectivity...")
 
     # Anthropic
     try:
@@ -1152,16 +1252,16 @@ def check_api_health(
         anthropic.APIConnectionError,
         anthropic.APIStatusError,
     ) as e:
-        print(f"\nAnthropic API is unreachable: {e}")
-        print("Check https://status.anthropic.com for service status.")
+        log.error("Anthropic API is unreachable: %s", e)
+        log.error("Check https://status.anthropic.com for service status.")
         sys.exit(1)
 
     # Fastmail
     try:
         get_jmap_session(fastmail_token)
     except requests.RequestException as e:
-        print(f"\nFastmail API is unreachable: {e}")
-        print("Check https://www.fastmailstatus.com for service status.")
+        log.error("Fastmail API is unreachable: %s", e)
+        log.error("Check https://www.fastmailstatus.com for service status.")
         sys.exit(1)
 
     # YNAB
@@ -1173,11 +1273,11 @@ def check_api_health(
         )
         response.raise_for_status()
     except requests.RequestException as e:
-        print(f"\nYNAB API is unreachable: {e}")
-        print("Check https://status.ynab.com for service status.")
+        log.error("YNAB API is unreachable: %s", e)
+        log.error("Check https://status.ynab.com for service status.")
         sys.exit(1)
 
-    print("All APIs reachable.")
+    log.info("All APIs reachable.")
 
 
 # =============================================================================
@@ -1577,7 +1677,7 @@ def create_ynab_transactions_batch(
         timeout=30,
     )
     if not response.ok:
-        print(f"    -> YNAB API error: {extract_ynab_error(response)}")
+        log.error("YNAB API error: %s", extract_ynab_error(response))
     response.raise_for_status()
 
     data = response.json()["data"]
@@ -1654,7 +1754,7 @@ def create_ynab_scheduled_transaction(
     )
 
     if not response.ok:
-        print(f"    -> YNAB API error: {extract_ynab_error(response)}")
+        log.error("YNAB API error: %s", extract_ynab_error(response))
     response.raise_for_status()
 
     return response.json()["data"]["scheduled_transaction"]["id"]
@@ -1790,10 +1890,10 @@ def refresh_payee_cache_if_needed(token: str, budget_id: str) -> list[str]:
         List of payee name strings.
     """
     if is_payee_cache_stale():
-        print("  Refreshing stale YNAB payee cache...")
+        log.debug("Refreshing stale YNAB payee cache...")
         payees, server_knowledge = fetch_ynab_payees(token, budget_id)
         cache_ynab_payees(payees, server_knowledge)
-        print(f"  Cached {len(payees)} payees from YNAB")
+        log.debug("Cached %d payees from YNAB", len(payees))
 
     return get_cached_payees()
 
@@ -1894,15 +1994,17 @@ def process_emails(force: bool = False):
 
 def _process_emails_impl(force: bool):
     """Internal implementation of process_emails (called with lock held)."""
-    if force:
-        print("*** FORCE MODE: Will bypass YNAB duplicate detection ***")
-        print()
-
     # Initialize database tables
     init_db()
 
     # Start a new run
     run_id = start_run()
+
+    # Set up file and console logging
+    setup_logging(run_id)
+
+    if force:
+        log.info("*** FORCE MODE: Will bypass YNAB duplicate detection ***")
 
     # Create Anthropic client once (reused for all emails)
     client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
@@ -1920,7 +2022,7 @@ def _process_emails_impl(force: bool):
         CONFIG["ynab_token"],
         CONFIG["ynab_budget_id"],
     )
-    print(f"Using {len(payee_names)} cached YNAB payees for matching")
+    log.info("Using %d cached YNAB payees for matching", len(payee_names))
 
     # Warn about payees with leading/trailing whitespace in YNAB
     with sqlite3.connect(DB_PATH) as conn:
@@ -1928,14 +2030,14 @@ def _process_emails_impl(force: bool):
         cursor.execute("SELECT name FROM ynab_payees WHERE deleted = 0")
         padded = [row[0] for row in cursor.fetchall() if row[0] != row[0].strip()]
     if padded:
-        print(f"WARNING: {len(padded)} YNAB payee(s) have leading/trailing whitespace:")
+        log.warning("%d YNAB payee(s) have leading/trailing whitespace:", len(padded))
         for name in padded:
-            print(f"    -> {name!r}")
+            log.warning("  %r", name)
 
     # Fetch recent emails from Fastmail
-    print("Fetching emails from inbox...")
+    log.info("Fetching emails from inbox...")
     emails = fetch_recent_emails(CONFIG["fastmail_token"])
-    print(f"Found {len(emails)} emails in Inbox")
+    log.info("Found %d emails in Inbox", len(emails))
 
     # Statistics counters
     receipts_added = 0  # New transactions created in YNAB
@@ -1954,20 +2056,22 @@ def _process_emails_impl(force: bool):
     # Track which transactions were actually created (not duplicates) by email_id
     created_email_ids: list[str] = []
 
+    below_threshold = 0  # Count of emails below score threshold (for console summary)
+
     for email in emails:
         # Skip emails we've already processed (unless force mode)
         if not force and is_processed(email.id):
-            print(f"  [SKIP] Already processed: {email.subject[:50]}")
+            log.debug("Already processed: %s", email.subject[:50])
             skipped += 1
             continue
 
-        print(f"  [CHECK] {email.subject[:60]}")
+        log.debug("Checking: %s", email.subject[:60])
 
         try:
             # Check classification cache before calling Claude API
             result = get_cached_classification(email.id)
             if result:
-                print("    -> (cached)")
+                log.debug("  (cached)")
                 cached += 1
             else:
                 # No cache hit - call Claude API and cache the result
@@ -1977,19 +2081,23 @@ def _process_emails_impl(force: bool):
                     cache_classification(email.id, result)
 
             direction_str = "INFLOW" if result.is_inflow else "OUTFLOW"
-            print(
-                f"    -> Score: {result.score}/10, Direction: {direction_str} - {result.reasoning or 'N/A'}"
+            log.debug(
+                "  Score: %d/10, Direction: %s - %s",
+                result.score,
+                direction_str,
+                result.reasoning or "N/A",
             )
 
             # Skip if below confidence threshold
             if result.score < CONFIG["min_score"]:
-                print(f"    -> Below threshold ({CONFIG['min_score']}), skipping")
+                log.debug("  Below threshold (%d), skipping", CONFIG["min_score"])
+                below_threshold += 1
                 non_receipt_emails.append(email.id)
                 continue
 
             # Skip if Claude couldn't extract an amount
             if result.amount is None:
-                print("    -> Missing amount, skipping")
+                log.debug("  Missing amount, skipping")
                 non_receipt_emails.append(email.id)
                 continue
 
@@ -1997,7 +2105,7 @@ def _process_emails_impl(force: bool):
             # Returns (validated_date, is_future) tuple
             transaction_date, is_future = validate_transaction_date(result.date, email.received_at)
             if not transaction_date:
-                print("    -> Invalid date and could not recover, skipping")
+                log.debug("  Invalid date and could not recover, skipping")
                 non_receipt_emails.append(email.id)
                 continue
 
@@ -2008,36 +2116,44 @@ def _process_emails_impl(force: bool):
             display_date = transaction_date
             if is_future and not use_scheduled_api:
                 today_str = datetime.now(UTC).date().strftime("%Y-%m-%d")
-                print(
-                    f"    -> Date adjusted: {transaction_date} -> {today_str} "
-                    f"(confidence: {result.date_confidence or 'unknown'})"
+                log.debug(
+                    "  Date adjusted: %s -> %s (confidence: %s)",
+                    transaction_date,
+                    today_str,
+                    result.date_confidence or "unknown",
                 )
                 transaction_date = today_str
 
             if transaction_date != result.date and not is_future:
                 if result.date:
-                    print(f"    -> Date adjusted: {result.date} -> {transaction_date}")
+                    log.debug("  Date adjusted: %s -> %s", result.date, transaction_date)
                 else:
-                    print(f"    -> No transaction date found, using email date: {transaction_date}")
+                    log.debug("  No transaction date found, using email date: %s", transaction_date)
 
             sign = "+" if result.is_inflow else "-"
-            print(
-                f"    -> Importing: {result.merchant} {sign}${result.amount:.2f} on {transaction_date}"
+            log.info(
+                "  %s -- %s$%.2f -- %s",
+                result.matched_payee or result.merchant or "Unknown",
+                sign,
+                result.amount,
+                get_account_for_transaction(result.account_name, ACCOUNTS).name,
             )
 
             # Use Claude's matched payee if available, otherwise fall back to merchant name
             final_payee = result.matched_payee or result.merchant or "Unknown"
             if result.matched_payee and result.matched_payee != result.merchant:
-                print(f"    -> Matched payee: '{result.merchant}' -> '{result.matched_payee}'")
+                log.debug("  Matched payee: '%s' -> '%s'", result.merchant, result.matched_payee)
 
             # Determine which account to use based on AI classification
             account = get_account_for_transaction(result.account_name, ACCOUNTS)
             if result.account_name and result.account_name == account.name:
-                print(f"    -> Routing to account: {account.name}")
+                log.debug("  Routing to account: %s", account.name)
             elif result.account_name:
                 # AI suggested an account that doesn't exist, using default
-                print(
-                    f"    -> Unknown account '{result.account_name}', using default: {account.name}"
+                log.debug(
+                    "  Unknown account '%s', using default: %s",
+                    result.account_name,
+                    account.name,
                 )
 
             # Build memo with metadata for reference in YNAB
@@ -2074,9 +2190,13 @@ def _process_emails_impl(force: bool):
             )
 
         except Exception as e:
-            print(f"    -> Error: {e}")
-            print(f"    -> {traceback.format_exc()}")
+            log.error("Error processing email: %s", e)
+            log.debug("Traceback:\n%s", traceback.format_exc())
             errors += 1
+
+    # Console summary of email processing
+    if below_threshold:
+        log.info("Skipped %d below threshold", below_threshold)
 
     # Mark non-receipt emails as processed
     for email_id in non_receipt_emails:
@@ -2084,17 +2204,15 @@ def _process_emails_impl(force: bool):
 
     # Interactive selection of transactions
     if not pending_transactions:
-        print()
-        print("No transactions to review.")
+        log.info("No transactions to review.")
         return
 
-    print()
     original_pending = pending_transactions.copy()
     result = select_transactions_interactive(pending_transactions, transaction_display_data)
 
     if result is None:
         # User cancelled with Ctrl+C - don't mark anything as processed (preview mode)
-        print("Cancelled. No emails marked as processed.")
+        log.info("Cancelled. No emails marked as processed.")
         return
 
     pending_transactions = result
@@ -2107,10 +2225,10 @@ def _process_emails_impl(force: bool):
             mark_processed(txn.email_id, is_receipt=True, ynab_id=None, run_id=run_id)
             skipped_count += 1
     if skipped_count:
-        print(f"Marked {skipped_count} skipped transaction(s) as processed.")
+        log.info("Marked %d skipped transaction(s) as processed.", skipped_count)
 
     if not pending_transactions:
-        print("No transactions selected. Marked skipped emails as processed.")
+        log.info("No transactions selected. Marked skipped emails as processed.")
         return
 
     # Split into scheduled and regular transactions
@@ -2119,8 +2237,7 @@ def _process_emails_impl(force: bool):
 
     # Create scheduled transactions in YNAB (one at a time, no batch API)
     if scheduled_transactions:
-        print()
-        print(f"Creating {len(scheduled_transactions)} scheduled transaction(s) in YNAB...")
+        log.info("Creating %d scheduled transaction(s) in YNAB...", len(scheduled_transactions))
 
         for txn in scheduled_transactions:
             try:
@@ -2134,24 +2251,23 @@ def _process_emails_impl(force: bool):
                     memo=txn.memo,
                     is_inflow=txn.is_inflow,
                 )
-                print(f"    -> Created scheduled for {txn.date}: {scheduled_id}")
+                log.info("  Created scheduled for %s: %s", txn.date, scheduled_id)
                 mark_processed(txn.email_id, is_receipt=True, ynab_id=scheduled_id, run_id=run_id)
                 scheduled_added += 1
                 created_email_ids.append(txn.email_id)
             except Exception as e:
-                print(f"    -> Error creating scheduled transaction: {e}")
+                log.error("Error creating scheduled transaction: %s", e)
                 errors += 1
 
     # Batch create regular transactions in YNAB
     if regular_transactions:
-        print()
-        print(f"Creating {len(regular_transactions)} transaction(s) in YNAB...")
+        log.info("Creating %d transaction(s) in YNAB...", len(regular_transactions))
 
         # Process in batches of 5
         batch_size = 5
         for i in range(0, len(regular_transactions), batch_size):
             batch = regular_transactions[i : i + batch_size]
-            print(f"  Batch {i // batch_size + 1}: {len(batch)} transactions")
+            log.debug("Batch %d: %d transactions", i // batch_size + 1, len(batch))
 
             try:
                 results = create_ynab_transactions_batch(
@@ -2162,18 +2278,18 @@ def _process_emails_impl(force: bool):
 
                 for email_id, ynab_id, already_existed in results:
                     if already_existed:
-                        print("    -> Already exists in YNAB (duplicate)")
+                        log.info("  Already exists in YNAB (duplicate)")
                         duplicates += 1
                     else:
-                        print(f"    -> Created: {ynab_id}")
+                        log.info("  Created: %s", ynab_id)
                         receipts_added += 1
                         created_email_ids.append(email_id)
 
                     mark_processed(email_id, is_receipt=True, ynab_id=ynab_id, run_id=run_id)
 
             except Exception as e:
-                print(f"    -> Batch error: {e}")
-                print(f"    -> {traceback.format_exc()}")
+                log.error("Batch error: %s", e)
+                log.debug("Traceback:\n%s", traceback.format_exc())
                 errors += len(batch)
 
     # Complete the run
@@ -2192,8 +2308,7 @@ def _process_emails_impl(force: bool):
         ]
 
         if display_transactions:
-            print()
-            print("Transactions created:")
+            log.info("Transactions created:")
 
             # Calculate column widths
             max_payee_len = max(len(payee) for _, payee, _, _, _, _ in display_transactions)
@@ -2202,20 +2317,50 @@ def _process_emails_impl(force: bool):
             acct_width = max(max_acct_len, 7)  # minimum "Account" header width
 
             # Print header
-            print(f"{'Date':<10}  {'Payee':<{payee_width}}  {'Amount':>9}  {'Account':<{acct_width}}  {'Score':>5}")
-            print(f"{'-' * 10}  {'-' * payee_width}  {'-' * 9}  {'-' * acct_width}  {'-' * 5}")
+            log.info(
+                "%-10s  %-*s  %9s  %-*s  %5s",
+                "Date",
+                payee_width,
+                "Payee",
+                "Amount",
+                acct_width,
+                "Account",
+                "Score",
+            )
+            log.info(
+                "%s  %s  %s  %s  %s",
+                "-" * 10,
+                "-" * payee_width,
+                "-" * 9,
+                "-" * acct_width,
+                "-" * 5,
+            )
 
             # Print rows
             for date, payee, amount, is_inflow, score, acct in display_transactions:
                 sign = "+" if is_inflow else "-"
                 amount_str = f"{sign}${amount:.2f}"
-                print(f"{date:<10}  {payee:<{payee_width}}  {amount_str:>9}  {acct:<{acct_width}}  {score:>5}")
+                log.info(
+                    "%-10s  %-*s  %9s  %-*s  %5d",
+                    date,
+                    payee_width,
+                    payee,
+                    amount_str,
+                    acct_width,
+                    acct,
+                    score,
+                )
 
     # Print summary statistics
-    print()
     scheduled_msg = f", {scheduled_added} scheduled" if scheduled_added else ""
-    print(
-        f"Done! {receipts_added} added{scheduled_msg}, {duplicates} already in YNAB, {skipped} skipped, {cached} from cache, {errors} errors"
+    log.info(
+        "=== Run complete: %d added%s, %d already in YNAB, %d skipped, %d from cache, %d errors ===",
+        receipts_added,
+        scheduled_msg,
+        duplicates,
+        skipped,
+        cached,
+        errors,
     )
 
 
