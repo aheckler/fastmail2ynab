@@ -1393,8 +1393,8 @@ Respond ONLY with valid JSON, no other text."""
         return ClassificationResult(
             score=int(data.get("score", 0)),
             is_inflow=(direction == "inflow"),
-            merchant=data.get("merchant", "").strip() or None,
-            matched_payee=data.get("matched_payee", "").strip() or None,
+            merchant=(data.get("merchant") or "").strip() or None,
+            matched_payee=(data.get("matched_payee") or "").strip() or None,
             amount=float(data["amount"]) if data.get("amount") else None,
             currency=data.get("currency", "USD"),
             date=data.get("date"),
