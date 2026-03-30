@@ -1616,6 +1616,7 @@ def create_ynab_transaction(
         "cleared": "uncleared",  # Not yet matched to bank transaction
         "approved": False,  # Requires manual review in YNAB
         "import_id": import_id,  # For deduplication
+        "category_id": None,  # Prevent YNAB auto-categorization
     }
 
     response = requests.post(
@@ -1676,6 +1677,7 @@ def create_ynab_transactions_batch(
                 "cleared": "uncleared",
                 "approved": False,
                 "import_id": pt.import_id,
+                "category_id": None,  # Prevent YNAB auto-categorization
             }
         )
 
@@ -1753,6 +1755,7 @@ def create_ynab_scheduled_transaction(
         "amount": milliunits,
         "payee_name": payee_name,
         "memo": memo,
+        "category_id": None,  # Prevent YNAB auto-categorization
     }
 
     response = requests.post(
