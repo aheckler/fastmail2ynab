@@ -2346,6 +2346,27 @@ def _process_emails_impl(force: bool):
                     is_inflow=txn.is_inflow,
                 )
                 log.info("  Created scheduled for %s: %s", txn.date, scheduled_id)
+
+                # Clear auto-assigned category on outflow scheduled transactions
+                if not txn.is_inflow:
+                    success = clear_ynab_scheduled_transaction_category(
+                        token=CONFIG["ynab_token"],
+                        budget_id=CONFIG["ynab_budget_id"],
+                        scheduled_transaction_id=scheduled_id,
+                    )
+                    if not success:
+                        print(
+                            "\n\033[1;33m"
+                            "⚠  WARNING: Failed to clear category on scheduled "
+                            f"transaction {scheduled_id}!\033[0m\n"
+                            "\033[33m"
+                            "This transaction was created in YNAB but has an "
+                            "incorrect auto-assigned category.\n"
+                            "Please manually remove its category in YNAB "
+                            "to avoid polluting your budget data."
+                            "\033[0m\n"
+                        )
+
                 mark_processed(txn.email_id, is_receipt=True, ynab_id=scheduled_id, run_id=run_id)
                 scheduled_added += 1
                 created_email_ids.append(txn.email_id)
@@ -2370,7 +2391,9 @@ def _process_emails_impl(force: bool):
                     pending_transactions=batch,
                 )
 
-                for email_id, ynab_id, already_existed in results:
+                # Collect non-inflow transaction IDs for category clearing
+                ids_to_clear = []
+                for (email_id, ynab_id, already_existed), pt in zip(results, batch):
                     if already_existed:
                         log.info("  Already exists in YNAB (duplicate)")
                         duplicates += 1
@@ -2378,8 +2401,31 @@ def _process_emails_impl(force: bool):
                         log.info("  Created: %s", ynab_id)
                         receipts_added += 1
                         created_email_ids.append(email_id)
+                        if not pt.is_inflow and ynab_id:
+                            ids_to_clear.append(ynab_id)
 
                     mark_processed(email_id, is_receipt=True, ynab_id=ynab_id, run_id=run_id)
+
+                # Clear auto-assigned categories on outflow transactions
+                if ids_to_clear:
+                    success = clear_ynab_transaction_categories(
+                        token=CONFIG["ynab_token"],
+                        budget_id=CONFIG["ynab_budget_id"],
+                        transaction_ids=ids_to_clear,
+                    )
+                    if not success:
+                        print(
+                            "\n\033[1;33m"
+                            "⚠  WARNING: Failed to clear categories on "
+                            f"{len(ids_to_clear)} transaction(s)!\033[0m\n"
+                            "\033[33m"
+                            "These transactions were created in YNAB but have "
+                            "incorrect auto-assigned categories.\n"
+                            "Please manually remove their categories in YNAB "
+                            "to avoid polluting your budget data.\n"
+                            f"Transaction IDs: {', '.join(ids_to_clear)}"
+                            "\033[0m\n"
+                        )
 
             except Exception as e:
                 log.error("Batch error: %s", e)
