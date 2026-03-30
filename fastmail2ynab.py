@@ -1712,6 +1712,48 @@ def create_ynab_transactions_batch(
     return results
 
 
+def clear_ynab_transaction_categories(
+    token: str,
+    budget_id: str,
+    transaction_ids: list[str],
+) -> bool:
+    """Clear auto-assigned categories on YNAB transactions.
+
+    YNAB auto-assigns categories based on payee history during creation.
+    This function PATCHes transactions to remove those categories, leaving
+    them uncategorized for manual review.
+
+    Args:
+        token: YNAB personal access token.
+        budget_id: Target budget UUID.
+        transaction_ids: List of YNAB transaction IDs to clear.
+
+    Returns:
+        True if successful, False if the API call failed.
+    """
+    if not transaction_ids:
+        return True
+
+    transactions = [{"id": tid, "category_id": None} for tid in transaction_ids]
+
+    response = requests.patch(
+        f"{YNAB_BASE_URL}/budgets/{budget_id}/transactions",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"transactions": transactions},
+        timeout=30,
+    )
+
+    if not response.ok:
+        log.error("Failed to clear categories: %s", extract_ynab_error(response))
+        return False
+
+    log.info("Cleared categories on %d transaction(s)", len(transaction_ids))
+    return True
+
+
 def create_ynab_scheduled_transaction(
     token: str,
     budget_id: str,
@@ -1773,6 +1815,43 @@ def create_ynab_scheduled_transaction(
     response.raise_for_status()
 
     return response.json()["data"]["scheduled_transaction"]["id"]
+
+
+def clear_ynab_scheduled_transaction_category(
+    token: str,
+    budget_id: str,
+    scheduled_transaction_id: str,
+) -> bool:
+    """Clear auto-assigned category on a YNAB scheduled transaction.
+
+    Args:
+        token: YNAB personal access token.
+        budget_id: Target budget UUID.
+        scheduled_transaction_id: YNAB scheduled transaction ID.
+
+    Returns:
+        True if successful, False if the API call failed.
+    """
+    response = requests.put(
+        f"{YNAB_BASE_URL}/budgets/{budget_id}/scheduled_transactions/{scheduled_transaction_id}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"scheduled_transaction": {"category_id": None}},
+        timeout=30,
+    )
+
+    if not response.ok:
+        log.error(
+            "Failed to clear category for scheduled transaction %s: %s",
+            scheduled_transaction_id,
+            extract_ynab_error(response),
+        )
+        return False
+
+    log.info("Cleared category on scheduled transaction %s", scheduled_transaction_id)
+    return True
 
 
 def fetch_ynab_payees(token: str, budget_id: str) -> tuple[list[dict], int]:
