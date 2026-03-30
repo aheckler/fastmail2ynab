@@ -1390,6 +1390,7 @@ Answer YES or NO for each criterion:
 8. `shipping_only` - Shipping/delivery notification without a charge
 9. `reminder_only` - Reminder, alert, or notice (not a confirmation)
 10. `marketing` - Marketing or promotional content
+11. `approximate_amount` - The stated amount is not the exact final charge (e.g., "$X + taxes", "starting at $X", "estimated $X")
 
 ## SCORING FORMULA
 
@@ -1408,6 +1409,7 @@ Calculate the score using these weights:
 - `balance_credit`: -4 (not real money movement)
 - `shipping_only`: -2 (has financial data, but not a charge)
 - `reminder_only`: -2 (may have amount, but no transaction yet)
+- `approximate_amount`: -5 (amount would be wrong, real receipt comes later)
 
 **Calculation:**
 1. Start with base score of 3
@@ -1432,7 +1434,8 @@ Respond with JSON in this exact format:
     "balance_credit": false,
     "shipping_only": false,
     "reminder_only": false,
-    "marketing": false
+    "marketing": false,
+    "approximate_amount": false
   }},
   "score": 8,
   "direction": "outflow",
@@ -1448,7 +1451,7 @@ Respond with JSON in this exact format:
 }}
 
 Rules:
-- "checklist" must contain all 10 boolean fields
+- "checklist" must contain all 11 boolean fields
 - "score" must be an integer from 1-10, calculated using the formula above
 - "direction" must be either "inflow" or "outflow"
 - "amount" must be the TOTAL amount charged to the payment method — including tax, tips, fees, and surcharges. If the email shows both a subtotal and a total, always use the total. Must be a positive number (no currency symbols), or null if not found

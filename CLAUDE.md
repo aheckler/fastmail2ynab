@@ -84,6 +84,7 @@ Claude uses an explicit checklist to score emails, making classification stable 
 | `balance_credit` | -4 | Not real money movement |
 | `shipping_only` | -2 | Financial data present, just not a charge |
 | `reminder_only` | -2 | May have amount, but no transaction yet |
+| `approximate_amount` | -5 | Amount would be wrong; real receipt comes later |
 
 **Score calculation:**
 1. Start with base score of 3
@@ -95,6 +96,7 @@ Claude uses an explicit checklist to score emails, making classification stable 
 - Amazon shipping (amount + merchant + shipping_only): 3 + 3 + 1 - 2 = **5**
 - School notification (merchant + reminder_only): 3 + 1 - 2 = **2**
 - Apple purchase receipt (all positives, no negatives): 3 + 3 + 3 + 2 + 2 + 1 + 1 = **10** (clamped)
+- Cell plan renewal ("$5 + taxes", reminder + approximate): 3 + 3 + 2 + 1 + 2 - 2 - 5 = **4**
 
 ## Configuration
 
