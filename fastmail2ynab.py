@@ -1451,7 +1451,7 @@ Rules:
 - "checklist" must contain all 10 boolean fields
 - "score" must be an integer from 1-10, calculated using the formula above
 - "direction" must be either "inflow" or "outflow"
-- "amount" must be a positive number (no currency symbols), or null if not found
+- "amount" must be the TOTAL amount charged to the payment method — including tax, tips, fees, and surcharges. If the email shows both a subtotal and a total, always use the total. Must be a positive number (no currency symbols), or null if not found
 - "date" must be YYYY-MM-DD format. For purchase receipts, use the purchase date. For bills with autopay, use the due date (when payment will be charged). For payment confirmations, use the payment date. Use null if not found.
 - "date_confidence" indicates how certain you are about the date:
   - "certain": The email explicitly states this exact date (e.g., "Due Date: Feb 19, 2026" or "Payment scheduled for 2/19/26")
