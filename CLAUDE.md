@@ -47,7 +47,7 @@ uv run fastmail2ynab.py --help
 
 The entire application is in a single file (`fastmail2ynab.py`) with these main components:
 
-1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol
+1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol. Archives successfully imported emails after YNAB upload.
 2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, date, date_confidence, inflow/outflow, account)
 3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence.
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations

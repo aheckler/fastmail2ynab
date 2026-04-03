@@ -9,7 +9,8 @@ A local Python script that automatically detects receipt emails in Fastmail and 
 3. Matches merchant names to existing YNAB payees using Claude for consistent naming
 4. Routes transactions to the appropriate YNAB account based on AI classification
 5. Creates unapproved transactions in YNAB in batches of 5
-6. Tracks processed emails and run history in a local SQLite database
+6. Archives the source emails in Fastmail (moves from Inbox to Archive)
+7. Tracks processed emails and run history in a local SQLite database
 
 ## Setup
 
@@ -32,7 +33,7 @@ Edit `.env` with your credentials:
 
 **Fastmail:**
 1. Go to Settings -> Privacy & Security -> Integrations -> API tokens
-2. Create a new token with "Mail" read access
+2. Create a new token with "Mail" read and write access
 
 **YNAB:**
 1. Go to Account Settings -> Developer Settings
@@ -220,3 +221,8 @@ This ensures transactions use your existing payee names for consistent categoriz
 - Press Ctrl+C during transaction selection to preview without importing
 - Classifications are cached, so re-running won't call Claude again
 - Emails won't be marked as processed, so they'll reappear on the next run
+
+**Emails not archiving**
+- Your Fastmail API token must have mail write access (not just read)
+- Check logs for "Cannot archive: Archive mailbox not found" which means your Fastmail account has no Archive mailbox
+- Archiving failures are non-fatal — transactions are still created in YNAB

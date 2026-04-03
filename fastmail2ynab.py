@@ -24,6 +24,7 @@ The workflow:
     - If score meets threshold, extract merchant/amount/date
     - Create an unapproved transaction in YNAB (or scheduled transaction for
       future-dated bills with high confidence)
+    - Archive the source emails in Fastmail after successful YNAB upload
     - Track processed emails in SQLite to avoid duplicates
     - Write detailed logs to logs/ directory (auto-pruned after 90 days)
 
@@ -35,7 +36,7 @@ Usage:
     uv run fastmail2ynab.py --force
 
 Environment Variables (in .env file):
-    FASTMAIL_TOKEN         - Fastmail API token with mail read access
+    FASTMAIL_TOKEN         - Fastmail API token with mail read/write access
     ANTHROPIC_API_KEY      - Claude API key
     YNAB_TOKEN             - YNAB personal access token
     YNAB_BUDGET_ID         - Target budget UUID
@@ -1232,6 +1233,94 @@ def fetch_recent_emails(token: str) -> list[Email]:
     return emails
 
 
+def archive_fastmail_emails(token: str, email_ids: list[str]) -> int:
+    """Archive emails in Fastmail by moving them from Inbox to Archive.
+
+    Uses JMAP Email/set with PatchObject patch paths to atomically remove
+    emails from the Inbox mailbox and add them to the Archive mailbox.
+    Other mailbox memberships (labels, folders) are preserved.
+
+    Args:
+        token: Fastmail API bearer token (requires mail write access).
+        email_ids: List of JMAP email IDs to archive.
+
+    Returns:
+        Number of emails successfully archived.
+    """
+    if not email_ids:
+        return 0
+
+    # Get session info (API URL and account ID)
+    session = get_jmap_session(token)
+    api_url = session["apiUrl"]
+    account_id = session["primaryAccounts"]["urn:ietf:params:jmap:mail"]
+
+    # Find Inbox and Archive mailbox IDs in a single request
+    mailbox_response = jmap_request(
+        api_url,
+        token,
+        [
+            ["Mailbox/query", {"accountId": account_id, "filter": {"name": "Inbox"}}, "0"],
+            ["Mailbox/query", {"accountId": account_id, "filter": {"role": "archive"}}, "1"],
+        ],
+        debug_label="Mailbox/query (inbox+archive)",
+    )
+
+    inbox_ids = mailbox_response["methodResponses"][0][1].get("ids", [])
+    archive_ids = mailbox_response["methodResponses"][1][1].get("ids", [])
+
+    if not inbox_ids:
+        log.warning("Cannot archive: Inbox mailbox not found")
+        return 0
+
+    if not archive_ids:
+        log.warning("Cannot archive: Archive mailbox not found")
+        return 0
+
+    inbox_id = inbox_ids[0]
+    archive_id = archive_ids[0]
+    log.debug("Archiving %d email(s): Inbox=%s, Archive=%s", len(email_ids), inbox_id, archive_id)
+
+    # Build update map: for each email, remove from Inbox and add to Archive
+    update = {}
+    for eid in email_ids:
+        update[eid] = {
+            f"mailboxIds/{inbox_id}": None,
+            f"mailboxIds/{archive_id}": True,
+        }
+
+    # Execute the archive operation
+    set_response = jmap_request(
+        api_url,
+        token,
+        [
+            [
+                "Email/set",
+                {
+                    "accountId": account_id,
+                    "update": update,
+                },
+                "2",
+            ]
+        ],
+        debug_label="Email/set (archive)",
+    )
+
+    set_result = set_response["methodResponses"][0][1]
+
+    # Count successes and log failures
+    updated = set_result.get("updated")
+    not_updated = set_result.get("notUpdated")
+
+    archived_count = len(updated) if updated else 0
+
+    if not_updated:
+        for eid, error in not_updated.items():
+            log.warning("Failed to archive email %s: %s", eid, error.get("description", error))
+
+    return archived_count
+
+
 # =============================================================================
 # API Health Checks
 # =============================================================================
@@ -2140,6 +2229,7 @@ def _process_emails_impl(force: bool):
     skipped = 0  # Skipped due to already in our processed_emails table
     cached = 0  # Used cached Claude classification (saved API calls)
     errors = 0  # Processing errors
+    archived = 0  # Successfully archived in Fastmail after YNAB upload
 
     # Collect pending transactions for batch creation
     pending_transactions: list[PendingTransaction] = []
@@ -2491,16 +2581,36 @@ def _process_emails_impl(force: bool):
                     score,
                 )
 
+    # Archive processed emails in Fastmail
+    if created_email_ids:
+        try:
+            archived = archive_fastmail_emails(CONFIG["fastmail_token"], created_email_ids)
+            if archived == len(created_email_ids):
+                log.info("Archived %d email(s) in Fastmail", archived)
+            elif archived > 0:
+                log.warning(
+                    "Archived %d of %d email(s) in Fastmail",
+                    archived,
+                    len(created_email_ids),
+                )
+            else:
+                log.warning("Failed to archive emails in Fastmail")
+        except Exception as e:
+            log.warning("Could not archive emails in Fastmail: %s", e)
+            log.debug("Traceback:\n%s", traceback.format_exc())
+
     # Print summary statistics
+    archived_msg = f", {archived} archived" if archived else ""
     scheduled_msg = f", {scheduled_added} scheduled" if scheduled_added else ""
     log.info(
-        "=== Run complete: %d added%s, %d already in YNAB, %d skipped, %d from cache, %d errors ===",
+        "=== Run complete: %d added%s, %d already in YNAB, %d skipped, %d from cache, %d errors%s ===",
         receipts_added,
         scheduled_msg,
         duplicates,
         skipped,
         cached,
         errors,
+        archived_msg,
     )
 
 
