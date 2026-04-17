@@ -61,6 +61,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -1963,6 +1964,63 @@ def set_ynab_scheduled_transaction_category(
     return True
 
 
+def fetch_ynab_transactions_since(
+    token: str,
+    budget_id: str,
+    since_date: str,
+) -> list[dict]:
+    """Fetch all YNAB transactions with date >= since_date.
+
+    Used during the category-verify phase to read back what YNAB actually
+    persisted after our PATCH. Returns the raw transaction dicts from the
+    API; the caller filters to the ids it cares about.
+
+    Args:
+        token: YNAB personal access token.
+        budget_id: Target budget UUID.
+        since_date: YYYY-MM-DD lower bound for transaction date.
+
+    Returns:
+        List of transaction dicts. Empty list on API error (logged).
+    """
+    response = requests.get(
+        f"{YNAB_BASE_URL}/budgets/{budget_id}/transactions",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"since_date": since_date},
+        timeout=30,
+    )
+    if not response.ok:
+        log.error("Failed to fetch transactions: %s", extract_ynab_error(response))
+        return []
+    return response.json()["data"]["transactions"]
+
+
+def fetch_ynab_scheduled_transactions(token: str, budget_id: str) -> list[dict]:
+    """Fetch all YNAB scheduled transactions.
+
+    Used during the category-verify phase. Returns all scheduled
+    transactions in the budget; caller filters to the ids it cares about.
+
+    Args:
+        token: YNAB personal access token.
+        budget_id: Target budget UUID.
+
+    Returns:
+        List of scheduled transaction dicts. Empty list on API error (logged).
+    """
+    response = requests.get(
+        f"{YNAB_BASE_URL}/budgets/{budget_id}/scheduled_transactions",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    if not response.ok:
+        log.error(
+            "Failed to fetch scheduled transactions: %s", extract_ynab_error(response)
+        )
+        return []
+    return response.json()["data"]["scheduled_transactions"]
+
+
 READY_TO_ASSIGN_NAME = "Inflow: Ready to Assign"
 
 
@@ -2215,6 +2273,166 @@ def select_transactions_interactive(
         return None
 
     return [txn for txn in pending if txn.email_id in selected_ids]
+
+
+SETTLE_DELAY_SECONDS = 10
+
+
+def _settle_and_enforce_categories(
+    regular_targets: dict[str, str | None],
+    scheduled_targets: dict[str, str | None],
+    earliest_date: str | None,
+) -> None:
+    """Override YNAB's auto-assigned categories with our expected values.
+
+    YNAB's server-side auto-categorization fires asynchronously after
+    transaction creation, and can race with our PATCH — sometimes landing
+    AFTER it and overwriting our values. This function serializes two
+    settle-then-patch phases and then verifies via GET, re-patching any
+    stragglers once.
+
+    Args:
+        regular_targets: {ynab_transaction_id: expected_category_id_or_null}
+        scheduled_targets: {ynab_scheduled_id: expected_category_id_or_null}
+        earliest_date: YYYY-MM-DD earliest transaction date (for GET filter).
+            None is only valid if regular_targets is empty.
+    """
+    token = CONFIG["ynab_token"]
+    budget_id = CONFIG["ynab_budget_id"]
+
+    # Phase 2: let YNAB's initial auto-categorization land before we override
+    log.info("Waiting %ds for YNAB to settle...", SETTLE_DELAY_SECONDS)
+    time.sleep(SETTLE_DELAY_SECONDS)
+
+    # Phase 3: bulk-patch every transaction to its expected category
+    total = len(regular_targets) + len(scheduled_targets)
+    log.info("Patching categories on %d transaction(s)...", total)
+    _apply_category_targets(token, budget_id, regular_targets, scheduled_targets)
+
+    # Phase 4: give YNAB another window in case any async auto-cat fires late
+    log.info("Waiting %ds before verifying categories...", SETTLE_DELAY_SECONDS)
+    time.sleep(SETTLE_DELAY_SECONDS)
+
+    # Phase 5: verify via GET, find any that don't match their expected value
+    log.info("Verifying categories on %d transaction(s)...", total)
+    regular_stragglers = _find_regular_stragglers(
+        token, budget_id, regular_targets, earliest_date
+    )
+    scheduled_stragglers = _find_scheduled_stragglers(
+        token, budget_id, scheduled_targets
+    )
+
+    # Phase 6: re-patch any stragglers once; if they still don't stick, warn
+    total_stragglers = len(regular_stragglers) + len(scheduled_stragglers)
+    if total_stragglers == 0:
+        log.info("All categories verified.")
+        return
+
+    log.info("Re-patching %d straggler(s)...", total_stragglers)
+    _apply_category_targets(token, budget_id, regular_stragglers, scheduled_stragglers)
+    print(
+        "\n\033[1;33m"
+        f"⚠  NOTE: {total_stragglers} transaction(s) needed a category retry "
+        "after YNAB's async auto-categorization.\033[0m\n"
+        "\033[33m"
+        "This is normal occasionally; if it keeps happening, inspect the log."
+        "\033[0m\n"
+    )
+
+
+def _apply_category_targets(
+    token: str,
+    budget_id: str,
+    regular_targets: dict[str, str | None],
+    scheduled_targets: dict[str, str | None],
+) -> None:
+    """PATCH regulars in one call, PUT each scheduled (no batch API)."""
+    if regular_targets:
+        success = patch_ynab_transaction_categories(
+            token=token,
+            budget_id=budget_id,
+            assignments=list(regular_targets.items()),
+        )
+        if not success:
+            affected_ids = list(regular_targets.keys())
+            print(
+                "\n\033[1;33m"
+                "⚠  WARNING: Failed to patch categories on "
+                f"{len(regular_targets)} transaction(s)!\033[0m\n"
+                "\033[33m"
+                "These transactions were created in YNAB but have "
+                "incorrect auto-assigned categories.\n"
+                "Please manually fix their categories in YNAB "
+                "to avoid polluting your budget data.\n"
+                f"Transaction IDs: {', '.join(affected_ids)}"
+                "\033[0m\n"
+            )
+    for scheduled_id, category_id in scheduled_targets.items():
+        success = set_ynab_scheduled_transaction_category(
+            token=token,
+            budget_id=budget_id,
+            scheduled_transaction_id=scheduled_id,
+            category_id=category_id,
+        )
+        if not success:
+            print(
+                "\n\033[1;33m"
+                "⚠  WARNING: Failed to set category on scheduled "
+                f"transaction {scheduled_id}!\033[0m\n"
+                "\033[33m"
+                "Please manually fix its category in YNAB."
+                "\033[0m\n"
+            )
+
+
+def _find_regular_stragglers(
+    token: str,
+    budget_id: str,
+    regular_targets: dict[str, str | None],
+    earliest_date: str | None,
+) -> dict[str, str | None]:
+    """Return targets whose current YNAB category_id does not match expected."""
+    if not regular_targets or not earliest_date:
+        return {}
+
+    current = fetch_ynab_transactions_since(token, budget_id, earliest_date)
+    observed = {t["id"]: t.get("category_id") for t in current if t["id"] in regular_targets}
+    stragglers: dict[str, str | None] = {}
+    for ynab_id, expected in regular_targets.items():
+        actual = observed.get(ynab_id)
+        if actual != expected:
+            log.debug(
+                "Straggler %s: expected category_id=%s, got %s", ynab_id, expected, actual
+            )
+            stragglers[ynab_id] = expected
+    return stragglers
+
+
+def _find_scheduled_stragglers(
+    token: str,
+    budget_id: str,
+    scheduled_targets: dict[str, str | None],
+) -> dict[str, str | None]:
+    """Return scheduled targets whose current category_id does not match expected."""
+    if not scheduled_targets:
+        return {}
+
+    current = fetch_ynab_scheduled_transactions(token, budget_id)
+    observed = {
+        t["id"]: t.get("category_id") for t in current if t["id"] in scheduled_targets
+    }
+    stragglers: dict[str, str | None] = {}
+    for scheduled_id, expected in scheduled_targets.items():
+        actual = observed.get(scheduled_id)
+        if actual != expected:
+            log.debug(
+                "Scheduled straggler %s: expected category_id=%s, got %s",
+                scheduled_id,
+                expected,
+                actual,
+            )
+            stragglers[scheduled_id] = expected
+    return stragglers
 
 
 def process_emails(force: bool = False):
@@ -2520,10 +2738,14 @@ def _process_emails_impl(force: bool):
         budget_id=CONFIG["ynab_budget_id"],
     )
 
-    # Create scheduled transactions in YNAB (one at a time, no batch API)
+    # Accumulated category targets: {ynab_id: expected_category_id}.
+    # Populated during creation, then used for bulk PATCH and verify.
+    regular_targets: dict[str, str | None] = {}
+    scheduled_targets: dict[str, str | None] = {}
+
+    # -------- Phase 1a: create all scheduled transactions --------
     if scheduled_transactions:
         log.info("Creating %d scheduled transaction(s) in YNAB...", len(scheduled_transactions))
-
         for txn in scheduled_transactions:
             try:
                 scheduled_id = create_ynab_scheduled_transaction(
@@ -2537,27 +2759,9 @@ def _process_emails_impl(force: bool):
                     is_inflow=txn.is_inflow,
                 )
                 log.info("  Created scheduled for %s: %s", txn.date, scheduled_id)
-
-                target_category_id = ready_to_assign_id if txn.is_inflow else None
-                success = set_ynab_scheduled_transaction_category(
-                    token=CONFIG["ynab_token"],
-                    budget_id=CONFIG["ynab_budget_id"],
-                    scheduled_transaction_id=scheduled_id,
-                    category_id=target_category_id,
+                scheduled_targets[scheduled_id] = (
+                    ready_to_assign_id if txn.is_inflow else None
                 )
-                if not success:
-                    print(
-                        "\n\033[1;33m"
-                        "⚠  WARNING: Failed to set category on scheduled "
-                        f"transaction {scheduled_id}!\033[0m\n"
-                        "\033[33m"
-                        "This transaction was created in YNAB but has an "
-                        "incorrect auto-assigned category.\n"
-                        "Please manually fix its category in YNAB "
-                        "to avoid polluting your budget data."
-                        "\033[0m\n"
-                    )
-
                 mark_processed(txn.email_id, is_receipt=True, ynab_id=scheduled_id, run_id=run_id)
                 scheduled_added += 1
                 created_email_ids.append(txn.email_id)
@@ -2565,11 +2769,10 @@ def _process_emails_impl(force: bool):
                 log.error("Error creating scheduled transaction: %s", e)
                 errors += 1
 
-    # Batch create regular transactions in YNAB
+    # -------- Phase 1b: create all regular transactions (batched) --------
+    earliest_date: str | None = None
     if regular_transactions:
         log.info("Creating %d transaction(s) in YNAB...", len(regular_transactions))
-
-        # Process in batches of 5
         batch_size = 5
         for i in range(0, len(regular_transactions), batch_size):
             batch = regular_transactions[i : i + batch_size]
@@ -2581,10 +2784,6 @@ def _process_emails_impl(force: bool):
                     budget_id=CONFIG["ynab_budget_id"],
                     pending_transactions=batch,
                 )
-
-                # Build per-transaction category assignments: inflows go to
-                # Ready to Assign, outflows are left uncategorized for review.
-                assignments: list[tuple[str, str | None]] = []
                 for (email_id, ynab_id, already_existed), pt in zip(results, batch):
                     if already_existed:
                         log.info("  Already exists in YNAB (duplicate)")
@@ -2594,37 +2793,25 @@ def _process_emails_impl(force: bool):
                         receipts_added += 1
                         created_email_ids.append(email_id)
                         if ynab_id:
-                            assignments.append(
-                                (ynab_id, ready_to_assign_id if pt.is_inflow else None)
+                            regular_targets[ynab_id] = (
+                                ready_to_assign_id if pt.is_inflow else None
                             )
+                            if earliest_date is None or pt.date < earliest_date:
+                                earliest_date = pt.date
 
                     mark_processed(email_id, is_receipt=True, ynab_id=ynab_id, run_id=run_id)
-
-                if assignments:
-                    success = patch_ynab_transaction_categories(
-                        token=CONFIG["ynab_token"],
-                        budget_id=CONFIG["ynab_budget_id"],
-                        assignments=assignments,
-                    )
-                    if not success:
-                        affected_ids = [tid for tid, _ in assignments]
-                        print(
-                            "\n\033[1;33m"
-                            "⚠  WARNING: Failed to patch categories on "
-                            f"{len(assignments)} transaction(s)!\033[0m\n"
-                            "\033[33m"
-                            "These transactions were created in YNAB but have "
-                            "incorrect auto-assigned categories.\n"
-                            "Please manually fix their categories in YNAB "
-                            "to avoid polluting your budget data.\n"
-                            f"Transaction IDs: {', '.join(affected_ids)}"
-                            "\033[0m\n"
-                        )
-
             except Exception as e:
                 log.error("Batch error: %s", e)
                 log.debug("Traceback:\n%s", traceback.format_exc())
                 errors += len(batch)
+
+    # -------- Phase 2-6: settle / patch / verify / re-patch categories --------
+    if regular_targets or scheduled_targets:
+        _settle_and_enforce_categories(
+            regular_targets=regular_targets,
+            scheduled_targets=scheduled_targets,
+            earliest_date=earliest_date,
+        )
 
     # Complete the run
     if scheduled_transactions or regular_transactions:

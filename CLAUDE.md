@@ -49,12 +49,24 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 
 1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol. Archives successfully imported emails after YNAB upload.
 2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed).
-3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence. After creation, PATCHes every transaction's `category_id`: outflows to `null` (uncategorized, flagged for review) and inflows to "Inflow: Ready to Assign". The Ready-to-Assign `category_id` is looked up once per budget and cached in `ynab_sync_state`.
+3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence. After all creates, runs a settle-then-enforce category phase (see "Category enforcement" below).
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
 5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`
 6. **Scheduled transactions**: Future dates (like autopay due dates) with "certain" confidence use YNAB's scheduled transactions API; others are capped to today
 7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata), `runs` (script execution history)
 8. **File-based logging**: Each run writes a detailed log to `logs/YYYY-MM-DD_HH-MM-SS.log` (DEBUG level). Console output is quieter (INFO level, milestones and accepted transactions only). Logs auto-prune after 90 days.
+
+## Category enforcement
+
+YNAB's server-side auto-categorization can fire asynchronously after a POST and race with an immediate PATCH, overwriting our intended category. To guarantee our values win, after all transactions are created the script runs:
+
+1. Sleep 10s to let YNAB's initial async auto-categorization land.
+2. Bulk PATCH every regular transaction's `category_id` (outflows → `null`, inflows → "Inflow: Ready to Assign"). Scheduled transactions are PUT one-by-one (no batch API).
+3. Sleep 10s to catch any late async writes.
+4. GET the transactions back (one call for regulars via `since_date`, one call for scheduled) and compare to expected.
+5. Re-PATCH any "stragglers" whose `category_id` doesn't match. Once only — no second verify loop.
+
+The Ready-to-Assign `category_id` is looked up once per budget and cached in `ynab_sync_state`. `SETTLE_DELAY_SECONDS = 10` controls both delays. Total added wall-clock time per run: ~20s.
 
 ## Key Data Structures
 
