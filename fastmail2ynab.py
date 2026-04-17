@@ -1814,29 +1814,30 @@ def create_ynab_transactions_batch(
     return results
 
 
-def clear_ynab_transaction_categories(
+def patch_ynab_transaction_categories(
     token: str,
     budget_id: str,
-    transaction_ids: list[str],
+    assignments: list[tuple[str, str | None]],
 ) -> bool:
-    """Clear auto-assigned categories on YNAB transactions.
+    """Set category_id on YNAB transactions via bulk PATCH.
 
     YNAB auto-assigns categories based on payee history during creation.
-    This function PATCHes transactions to remove those categories, leaving
-    them uncategorized for manual review.
+    This function overrides those assignments: outflows are routed to
+    "uncategorized" (None) for manual review, and inflows are routed to
+    "Inflow: Ready to Assign".
 
     Args:
         token: YNAB personal access token.
         budget_id: Target budget UUID.
-        transaction_ids: List of YNAB transaction IDs to clear.
+        assignments: List of (transaction_id, category_id_or_null) tuples.
 
     Returns:
         True if successful, False if the API call failed.
     """
-    if not transaction_ids:
+    if not assignments:
         return True
 
-    transactions = [{"id": tid, "category_id": None} for tid in transaction_ids]
+    transactions = [{"id": tid, "category_id": cid} for tid, cid in assignments]
 
     response = requests.patch(
         f"{YNAB_BASE_URL}/budgets/{budget_id}/transactions",
@@ -1849,10 +1850,10 @@ def clear_ynab_transaction_categories(
     )
 
     if not response.ok:
-        log.error("Failed to clear categories: %s", extract_ynab_error(response))
+        log.error("Failed to patch categories: %s", extract_ynab_error(response))
         return False
 
-    log.info("Cleared categories on %d transaction(s)", len(transaction_ids))
+    log.info("Patched categories on %d transaction(s)", len(assignments))
     return True
 
 
@@ -1919,17 +1920,19 @@ def create_ynab_scheduled_transaction(
     return response.json()["data"]["scheduled_transaction"]["id"]
 
 
-def clear_ynab_scheduled_transaction_category(
+def set_ynab_scheduled_transaction_category(
     token: str,
     budget_id: str,
     scheduled_transaction_id: str,
+    category_id: str | None,
 ) -> bool:
-    """Clear auto-assigned category on a YNAB scheduled transaction.
+    """Set category_id on a YNAB scheduled transaction.
 
     Args:
         token: YNAB personal access token.
         budget_id: Target budget UUID.
         scheduled_transaction_id: YNAB scheduled transaction ID.
+        category_id: Target category UUID, or None to leave uncategorized.
 
     Returns:
         True if successful, False if the API call failed.
@@ -1940,20 +1943,88 @@ def clear_ynab_scheduled_transaction_category(
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
-        json={"scheduled_transaction": {"category_id": None}},
+        json={"scheduled_transaction": {"category_id": category_id}},
         timeout=30,
     )
 
     if not response.ok:
         log.error(
-            "Failed to clear category for scheduled transaction %s: %s",
+            "Failed to set category for scheduled transaction %s: %s",
             scheduled_transaction_id,
             extract_ynab_error(response),
         )
         return False
 
-    log.info("Cleared category on scheduled transaction %s", scheduled_transaction_id)
+    log.info(
+        "Set category on scheduled transaction %s to %s",
+        scheduled_transaction_id,
+        category_id or "null",
+    )
     return True
+
+
+READY_TO_ASSIGN_NAME = "Inflow: Ready to Assign"
+
+
+def get_ready_to_assign_category_id(token: str, budget_id: str) -> str:
+    """Return the "Inflow: Ready to Assign" category_id for this budget.
+
+    Caches the result in ynab_sync_state since category_ids are stable
+    per budget. Fetches from YNAB on first use or if the cache is empty.
+
+    Args:
+        token: YNAB personal access token.
+        budget_id: Target budget UUID.
+
+    Returns:
+        The category_id of "Inflow: Ready to Assign".
+
+    Raises:
+        RuntimeError: If the category cannot be found in the budget.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM ynab_sync_state WHERE key = 'ready_to_assign_category_id'"
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0]
+
+    log.debug("Fetching YNAB categories to locate %r...", READY_TO_ASSIGN_NAME)
+    response = requests.get(
+        f"{YNAB_BASE_URL}/budgets/{budget_id}/categories",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    if not response.ok:
+        log.error("Failed to fetch categories: %s", extract_ynab_error(response))
+    response.raise_for_status()
+
+    category_id = None
+    for group in response.json()["data"]["category_groups"]:
+        for category in group.get("categories", []):
+            if category.get("name") == READY_TO_ASSIGN_NAME:
+                category_id = category["id"]
+                break
+        if category_id:
+            break
+
+    if not category_id:
+        raise RuntimeError(
+            f"Could not find {READY_TO_ASSIGN_NAME!r} category in YNAB budget {budget_id}"
+        )
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO ynab_sync_state (key, value) VALUES (?, ?)",
+            ("ready_to_assign_category_id", category_id),
+        )
+        conn.commit()
+
+    log.debug("Cached Ready-to-Assign category_id: %s", category_id)
+    return category_id
 
 
 def fetch_ynab_payees(token: str, budget_id: str) -> tuple[list[dict], int]:
@@ -2442,6 +2513,13 @@ def _process_emails_impl(force: bool):
     scheduled_transactions = [t for t in pending_transactions if t.is_scheduled]
     regular_transactions = [t for t in pending_transactions if not t.is_scheduled]
 
+    # Resolve the Ready-to-Assign category once; inflows are routed there,
+    # outflows are left uncategorized for manual review.
+    ready_to_assign_id = get_ready_to_assign_category_id(
+        token=CONFIG["ynab_token"],
+        budget_id=CONFIG["ynab_budget_id"],
+    )
+
     # Create scheduled transactions in YNAB (one at a time, no batch API)
     if scheduled_transactions:
         log.info("Creating %d scheduled transaction(s) in YNAB...", len(scheduled_transactions))
@@ -2460,25 +2538,25 @@ def _process_emails_impl(force: bool):
                 )
                 log.info("  Created scheduled for %s: %s", txn.date, scheduled_id)
 
-                # Clear auto-assigned category on outflow scheduled transactions
-                if not txn.is_inflow:
-                    success = clear_ynab_scheduled_transaction_category(
-                        token=CONFIG["ynab_token"],
-                        budget_id=CONFIG["ynab_budget_id"],
-                        scheduled_transaction_id=scheduled_id,
+                target_category_id = ready_to_assign_id if txn.is_inflow else None
+                success = set_ynab_scheduled_transaction_category(
+                    token=CONFIG["ynab_token"],
+                    budget_id=CONFIG["ynab_budget_id"],
+                    scheduled_transaction_id=scheduled_id,
+                    category_id=target_category_id,
+                )
+                if not success:
+                    print(
+                        "\n\033[1;33m"
+                        "⚠  WARNING: Failed to set category on scheduled "
+                        f"transaction {scheduled_id}!\033[0m\n"
+                        "\033[33m"
+                        "This transaction was created in YNAB but has an "
+                        "incorrect auto-assigned category.\n"
+                        "Please manually fix its category in YNAB "
+                        "to avoid polluting your budget data."
+                        "\033[0m\n"
                     )
-                    if not success:
-                        print(
-                            "\n\033[1;33m"
-                            "⚠  WARNING: Failed to clear category on scheduled "
-                            f"transaction {scheduled_id}!\033[0m\n"
-                            "\033[33m"
-                            "This transaction was created in YNAB but has an "
-                            "incorrect auto-assigned category.\n"
-                            "Please manually remove its category in YNAB "
-                            "to avoid polluting your budget data."
-                            "\033[0m\n"
-                        )
 
                 mark_processed(txn.email_id, is_receipt=True, ynab_id=scheduled_id, run_id=run_id)
                 scheduled_added += 1
@@ -2504,8 +2582,9 @@ def _process_emails_impl(force: bool):
                     pending_transactions=batch,
                 )
 
-                # Collect non-inflow transaction IDs for category clearing
-                ids_to_clear = []
+                # Build per-transaction category assignments: inflows go to
+                # Ready to Assign, outflows are left uncategorized for review.
+                assignments: list[tuple[str, str | None]] = []
                 for (email_id, ynab_id, already_existed), pt in zip(results, batch):
                     if already_existed:
                         log.info("  Already exists in YNAB (duplicate)")
@@ -2514,29 +2593,31 @@ def _process_emails_impl(force: bool):
                         log.info("  Created: %s", ynab_id)
                         receipts_added += 1
                         created_email_ids.append(email_id)
-                        if not pt.is_inflow and ynab_id:
-                            ids_to_clear.append(ynab_id)
+                        if ynab_id:
+                            assignments.append(
+                                (ynab_id, ready_to_assign_id if pt.is_inflow else None)
+                            )
 
                     mark_processed(email_id, is_receipt=True, ynab_id=ynab_id, run_id=run_id)
 
-                # Clear auto-assigned categories on outflow transactions
-                if ids_to_clear:
-                    success = clear_ynab_transaction_categories(
+                if assignments:
+                    success = patch_ynab_transaction_categories(
                         token=CONFIG["ynab_token"],
                         budget_id=CONFIG["ynab_budget_id"],
-                        transaction_ids=ids_to_clear,
+                        assignments=assignments,
                     )
                     if not success:
+                        affected_ids = [tid for tid, _ in assignments]
                         print(
                             "\n\033[1;33m"
-                            "⚠  WARNING: Failed to clear categories on "
-                            f"{len(ids_to_clear)} transaction(s)!\033[0m\n"
+                            "⚠  WARNING: Failed to patch categories on "
+                            f"{len(assignments)} transaction(s)!\033[0m\n"
                             "\033[33m"
                             "These transactions were created in YNAB but have "
                             "incorrect auto-assigned categories.\n"
-                            "Please manually remove their categories in YNAB "
+                            "Please manually fix their categories in YNAB "
                             "to avoid polluting your budget data.\n"
-                            f"Transaction IDs: {', '.join(ids_to_clear)}"
+                            f"Transaction IDs: {', '.join(affected_ids)}"
                             "\033[0m\n"
                         )
 

@@ -9,8 +9,9 @@ A local Python script that automatically detects receipt emails in Fastmail and 
 3. Matches merchant names to existing YNAB payees using Claude for consistent naming
 4. Routes transactions to the appropriate YNAB account based on AI classification
 5. Creates unapproved transactions in YNAB in batches of 5
-6. Archives the source emails in Fastmail (moves from Inbox to Archive)
-7. Tracks processed emails and run history in a local SQLite database
+6. Overrides YNAB's auto-assigned categories: outflows are left uncategorized for review, inflows are routed to "Inflow: Ready to Assign"
+7. Archives the source emails in Fastmail (moves from Inbox to Archive)
+8. Tracks processed emails and run history in a local SQLite database
 
 ## Setup
 

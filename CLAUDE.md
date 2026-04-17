@@ -49,7 +49,7 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 
 1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol. Archives successfully imported emails after YNAB upload.
 2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed).
-3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence.
+3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence. After creation, PATCHes every transaction's `category_id`: outflows to `null` (uncategorized, flagged for review) and inflows to "Inflow: Ready to Assign". The Ready-to-Assign `category_id` is looked up once per budget and cached in `ynab_sync_state`.
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
 5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`
 6. **Scheduled transactions**: Future dates (like autopay due dates) with "certain" confidence use YNAB's scheduled transactions API; others are capped to today
