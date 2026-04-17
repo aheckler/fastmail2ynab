@@ -132,6 +132,14 @@ This is reflected correctly in YNAB—outflows show as negative amounts, inflows
 
 Each imported transaction includes the memo: `Imported by fastmail2ynab`
 
+## Non-USD transactions
+
+The script is USD-only and does not perform currency conversion. Claude identifies every currency in each email and:
+
+- If an email shows **only** non-USD currency (e.g., a receipt entirely in GBP or EUR), the email is skipped with a `Non-USD currency (XXX), skipping` log line.
+- If an email shows **USD alongside other currencies** (e.g., a travel booking with both a USD total and a GBP breakdown), the USD amount is used.
+- If no currency can be identified, the email is treated as USD.
+
 ## Multi-Account Routing
 
 Claude determines which YNAB account each transaction belongs to based on:

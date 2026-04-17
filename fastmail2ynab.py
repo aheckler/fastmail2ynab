@@ -1511,6 +1511,18 @@ Calculate the score using these weights:
 - OUTFLOW: Money I spent (purchases, subscriptions, bills, fees, charges)
 - INFLOW: Money returned to my actual payment method (refunds to credit card, refunds to bank account, cashback deposits). NOT store credit, account balances, or gift card balances.
 
+## CURRENCY
+
+Identify every currency that appears in the email — symbols (`$`, `£`, `€`, `¥`) and codes (`USD`, `GBP`, `EUR`, `JPY`, etc.). Note: a bare `$` is ambiguous (could be USD, CAD, AUD, MXN); treat it as USD unless the email context clearly indicates otherwise (e.g., "CAD $", "AU$").
+
+Then extract the amount using these rules:
+
+- If the email shows USD alongside one or more other currencies, extract the **USD** amount and set `currency: "USD"`.
+- If the email shows **only** non-USD currency (e.g., only GBP, only EUR), extract that amount and set `currency` to the actual 3-letter ISO code (e.g. `"GBP"`, `"EUR"`). Do NOT default to USD.
+- If no currency is identifiable in the email, set `currency: null`.
+
+The `amount` you return must be denominated in the currency you report. Do not convert between currencies.
+
 Respond with JSON in this exact format:
 {{
   "checklist": {{
@@ -1543,7 +1555,8 @@ Rules:
 - "checklist" must contain all 11 boolean fields
 - "score" must be an integer from 1-10, calculated using the formula above
 - "direction" must be either "inflow" or "outflow"
-- "amount" must be the TOTAL amount charged to the payment method — including tax, tips, fees, and surcharges. If the email shows both a subtotal and a total, always use the total. Must be a positive number (no currency symbols), or null if not found
+- "amount" must be the TOTAL amount charged to the payment method — including tax, tips, fees, and surcharges. If the email shows both a subtotal and a total, always use the total. Must be a positive number (no currency symbols), or null if not found. See the CURRENCY section above for which amount to pick when multiple currencies are present.
+- "currency" must be the 3-letter ISO code of the currency in which `amount` is denominated (e.g. "USD", "GBP", "EUR"). Set to null only if no currency is identifiable in the email. Do not default to "USD" when the email clearly shows a different currency.
 - "date" must be YYYY-MM-DD format. For purchase receipts, use the purchase date. For bills with autopay, use the due date (when payment will be charged). For payment confirmations, use the payment date. Use null if not found.
 - "date_confidence" indicates how certain you are about the date:
   - "certain": The email explicitly states this exact date (e.g., "Due Date: Feb 19, 2026" or "Payment scheduled for 2/19/26")
@@ -1597,7 +1610,7 @@ Respond ONLY with valid JSON, no other text."""
             merchant=(data.get("merchant") or "").strip() or None,
             matched_payee=(data.get("matched_payee") or "").strip() or None,
             amount=float(data["amount"]) if data.get("amount") else None,
-            currency=data.get("currency", "USD"),
+            currency=(data.get("currency") or "").strip().upper() or None,
             date=data.get("date"),
             date_confidence=data.get("date_confidence"),
             description=data.get("description"),
@@ -2282,6 +2295,16 @@ def _process_emails_impl(force: bool):
             # Skip if Claude couldn't extract an amount
             if result.amount is None:
                 log.debug("  Missing amount, skipping")
+                non_receipt_emails.append(email.id)
+                continue
+
+            # Skip if the transaction isn't in USD — we don't do on-the-fly conversion
+            if result.currency and result.currency.upper() != "USD":
+                log.info(
+                    "  Non-USD currency (%s), skipping: %s",
+                    result.currency,
+                    email.subject[:50],
+                )
                 non_receipt_emails.append(email.id)
                 continue
 

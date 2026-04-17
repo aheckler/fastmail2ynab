@@ -48,7 +48,7 @@ uv run fastmail2ynab.py --help
 The entire application is in a single file (`fastmail2ynab.py`) with these main components:
 
 1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol. Archives successfully imported emails after YNAB upload.
-2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, date, date_confidence, inflow/outflow, account)
+2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed).
 3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence.
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
 5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`
@@ -60,7 +60,7 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 
 - `Account`: name, ynab_id, notes, default (for multi-account routing)
 - `Email`: id, subject, from_email, received_at, body
-- `ClassificationResult`: score (1-10), is_inflow, merchant, amount, currency, date, date_confidence ("certain"/"likely"/None), description, reasoning, account_name, checklist
+- `ClassificationResult`: score (1-10), is_inflow, merchant, amount, currency (3-letter ISO code; non-USD values cause the email to be skipped), date, date_confidence ("certain"/"likely"/None), description, reasoning, account_name, checklist
 - `PendingTransaction`: email_id, account_id, amount, date, payee_name, memo, import_id, is_inflow, is_scheduled (used for batch creation and scheduled transactions)
 
 ### Classification Checklist
