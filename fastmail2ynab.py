@@ -1342,7 +1342,7 @@ def check_api_health(
     # Anthropic
     try:
         client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=1,
             messages=[{"role": "user", "content": "hi"}],
         )
@@ -1558,7 +1558,7 @@ Rules:
 Respond ONLY with valid JSON, no other text."""
 
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
