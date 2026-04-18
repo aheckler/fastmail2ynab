@@ -6,6 +6,7 @@
 #     "python-dotenv>=1.0.0",
 #     "anthropic>=0.18.0",
 #     "questionary>=2.0.0",
+#     "html2text>=2024.2.26",
 # ]
 # ///
 """
@@ -66,11 +67,11 @@ import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from html.parser import HTMLParser
 from pathlib import Path
 
 # Third-party
 import anthropic
+import html2text
 import questionary
 import requests
 from dotenv import load_dotenv
@@ -540,62 +541,20 @@ def validate_transaction_date(
 # =============================================================================
 
 
-class HTMLStripper(HTMLParser):
-    """Extracts plain text from HTML by parsing and collecting text nodes.
-
-    Uses Python's built-in HTMLParser to walk through HTML structure,
-    skipping script and style tags (which contain non-visible code/CSS)
-    and collecting all other text content.
-
-    Usage:
-        stripper = HTMLStripper()
-        stripper.feed("<p>Hello <b>world</b></p>")
-        text = stripper.get_text()  # "Hello world"
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.text = []  # Accumulates text fragments
-        self.skip = False  # True when inside script/style tags
-
-    def handle_starttag(self, tag, attrs):
-        """Called for each opening tag. Enables skip mode for script/style."""
-        if tag in ("script", "style"):
-            self.skip = True
-
-    def handle_endtag(self, tag):
-        """Called for each closing tag. Disables skip mode for script/style."""
-        if tag in ("script", "style"):
-            self.skip = False
-
-    def handle_data(self, data):
-        """Called for text content between tags. Collects if not skipping."""
-        if not self.skip:
-            self.text.append(data)
-
-    def get_text(self) -> str:
-        """Returns all collected text joined with spaces."""
-        return " ".join(self.text)
-
-
 def strip_html(html: str) -> str:
-    """Remove HTML tags and return plain text.
+    """Convert HTML email body to plain text suitable for AI classification.
 
-    Attempts proper HTML parsing first, falling back to regex-based
-    tag removal if parsing fails (e.g., malformed HTML).
-
-    Args:
-        html: Raw HTML string to convert.
-
-    Returns:
-        Plain text with HTML tags removed and whitespace normalized.
+    Uses html2text, which correctly strips <style>/<script>/comments/CDATA
+    and handles malformed or truncated HTML — both common in marketing emails.
+    Falls back to a regex tag-strip if html2text raises.
     """
-    stripper = HTMLStripper()
     try:
-        stripper.feed(html)
-        return stripper.get_text()
+        h = html2text.HTML2Text()
+        h.ignore_links = True
+        h.ignore_images = True
+        h.body_width = 0  # disable line wrapping
+        return h.handle(html).strip()
     except Exception:
-        # Fallback for malformed HTML: strip tags with regex
         text = re.sub(r"<[^>]+>", " ", html)
         return " ".join(text.split())
 
@@ -1156,7 +1115,7 @@ def fetch_recent_emails(token: str) -> list[Email]:
                     ],
                     "fetchTextBodyValues": True,  # Include text body content
                     "fetchHTMLBodyValues": True,  # Include HTML body content
-                    "maxBodyValueBytes": 50000,  # Limit body size
+                    "maxBodyValueBytes": 200000,  # Shopify/Klaviyo emails commonly run 60-150KB
                 },
                 "2",
             ]
@@ -1195,22 +1154,37 @@ def fetch_recent_emails(token: str) -> list[Email]:
             if body_value.get("value"):
                 html_body += strip_html(body_value["value"])
 
-        # Decide which body to use
-        # Some emails have a stub text body like "Please enable HTML to view this email"
-        # In those cases, prefer the HTML body which has the actual content
+        # Decide which body to use. Reject the text/plain body if:
+        #   - It's a stub ("Please enable HTML to view this email"), or
+        #   - It's a broken plaintext alternative that contains a raw CSS
+        #     source dump (some senders, e.g. Shopify/Klaviyo, emit CSS as
+        #     their text/plain part). In either case, prefer the HTML body.
         stub_phrases = ["enable html", "view this email", "html version", "html-enabled"]
         text_is_stub = (
             text_body
             and len(text_body) < 2000
             and any(phrase in text_body.lower() for phrase in stub_phrases)
         )
+        css_tokens = (
+            "!important",
+            "@media",
+            "-webkit-",
+            "font-family:",
+            "background-color:",
+            "margin:",
+            "padding:",
+        )
+        text_is_css_dump = (
+            text_body and sum(1 for tok in css_tokens if tok in text_body) >= 3
+        )
+        text_is_unusable = text_is_stub or text_is_css_dump
 
-        if text_body and not text_is_stub:
+        if text_body and not text_is_unusable:
             body = text_body
         elif html_body:
             body = html_body
         else:
-            body = text_body  # Use stub if nothing else available
+            body = text_body  # Use unusable text body if nothing else available
 
         # Last resort: use the preview snippet
         if not body:
@@ -1219,6 +1193,13 @@ def fetch_recent_emails(token: str) -> list[Email]:
         # Extract sender email address
         from_list = email_data.get("from") or []
         from_email = from_list[0].get("email", "unknown") if from_list else "unknown"
+
+        log.debug(
+            "  Body[%d chars] %s: %s",
+            len(body),
+            email_data.get("subject") or "(no subject)",
+            body[:300].replace("\n", " "),
+        )
 
         emails.append(
             Email(

@@ -47,7 +47,7 @@ uv run fastmail2ynab.py --help
 
 The entire application is in a single file (`fastmail2ynab.py`) with these main components:
 
-1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol. Archives successfully imported emails after YNAB upload.
+1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol (up to 200KB per body value). HTML bodies are converted to plain text with `html2text` before being passed to Claude. The `text/plain` alternative is preferred unless it's a stub ("please enable HTML") or a broken CSS-source dump (some senders, notably Shopify/Klaviyo, emit their stylesheet as plaintext); in those cases the HTML alternative is used. Archives successfully imported emails after YNAB upload.
 2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed).
 3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence. After all creates, runs a settle-then-enforce category phase (see "Category enforcement" below).
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
@@ -145,4 +145,4 @@ The `.env.notes` file provides detailed descriptions to help Claude route transa
 
 ## Dependencies
 
-Uses `requests` for HTTP, `anthropic` for Claude API, `python-dotenv` for env loading. No test framework configured.
+Uses `requests` for HTTP, `anthropic` for Claude API, `python-dotenv` for env loading, `html2text` for converting HTML email bodies to plain text, `questionary` for interactive prompts. No test framework configured.
