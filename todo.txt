@@ -1,4 +1,3 @@
-- Archive emails in Fastmail after uploading the associated transaction to YNAB
 - AI-based dedupe of transactions after scoring them all, before TUI kicks in
 - Guided learning ability, where if the AI analysis scores an email over the threshold, but I deselect it in the TUI, it should ask me why I did that, then take that into account for future runs, should it encounter similar emails.
 - Adjustment of scoring mechanism to use 3 ranges instead of 2. Current emails can either be over the threshold or not over it, but perhaps we should have three ranges. Something along the lines of: 1-4 definitely not a transactions, 5-6 unsure ask the user, 7-10 definite transaction.
