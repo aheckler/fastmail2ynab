@@ -1548,6 +1548,7 @@ Rules:
 - "merchant" should be the business/source name as it appears in the email, or null if not found
 - "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "Co.", etc. Only use a value from the provided list.
 - "account_name" should be the EXACT name from the ACCOUNTS list that this transaction belongs to based on the account descriptions. Use null to route to the default account. Only use a value from the provided list.
+- Account descriptions may list "last 4" digits for an account number and/or a debit/credit card. If the email references an account or card ending in any of an account's listed last-4 values, that is a definitive routing match — use that account. Do not invent a digit-to-account mapping that is not explicitly stated; if the email's digits match no listed value, ignore them and route using the rest of the descriptions.
 - "description" should briefly describe the transaction
 
 Respond ONLY with valid JSON, no other text."""
@@ -1721,11 +1722,56 @@ def create_ynab_transaction(
     return (response.json()["data"]["transaction"]["id"], False)
 
 
+def _map_batch_create_results(
+    pending_transactions: list[PendingTransaction],
+    data: dict,
+) -> list[tuple[str, str | None, bool]]:
+    """Pair each submitted PendingTransaction with its created YNAB id.
+
+    YNAB's batch-create response returns ``data.transactions`` sorted by
+    transaction date, NOT in submission order, so results must be matched
+    back by ``import_id`` rather than by list position. Every regular
+    transaction carries a unique non-null import_id (only scheduled
+    transactions get None, and those are never batched).
+
+    Args:
+        pending_transactions: The transactions submitted, in submission order.
+        data: The ``data`` object from YNAB's POST /transactions response.
+
+    Returns:
+        List of (email_id, transaction_id, already_existed), in the same
+        order as ``pending_transactions``. transaction_id is None for
+        duplicates and for any transaction missing from the response.
+    """
+    id_by_import_id = {
+        t["import_id"]: t["id"]
+        for t in data.get("transactions", [])
+        if t.get("import_id")
+    }
+    duplicate_import_ids = set(data.get("duplicate_import_ids", []))
+
+    results: list[tuple[str, str | None, bool]] = []
+    for pt in pending_transactions:
+        if pt.import_id in duplicate_import_ids:
+            results.append((pt.email_id, None, True))
+        else:
+            transaction_id = id_by_import_id.get(pt.import_id)
+            if transaction_id is None:
+                log.error(
+                    "YNAB response has no transaction for import_id %s (email %s)",
+                    pt.import_id,
+                    pt.email_id,
+                )
+            results.append((pt.email_id, transaction_id, False))
+
+    return results
+
+
 def create_ynab_transactions_batch(
     token: str,
     budget_id: str,
     pending_transactions: list[PendingTransaction],
-) -> list[tuple[str, str, bool]]:
+) -> list[tuple[str, str | None, bool]]:
     """Create multiple transactions in YNAB in a single API call.
 
     YNAB supports batch creation of up to 1000 transactions per call.
@@ -1778,22 +1824,7 @@ def create_ynab_transactions_batch(
         log.error("YNAB API error: %s", extract_ynab_error(response))
     response.raise_for_status()
 
-    data = response.json()["data"]
-    created_ids = [t["id"] for t in data.get("transactions", [])]
-    duplicate_import_ids = set(data.get("duplicate_import_ids", []))
-
-    # Map results back to email IDs
-    results = []
-    created_idx = 0
-    for pt in pending_transactions:
-        if pt.import_id in duplicate_import_ids:
-            results.append((pt.email_id, None, True))
-        else:
-            transaction_id = created_ids[created_idx] if created_idx < len(created_ids) else None
-            results.append((pt.email_id, transaction_id, False))
-            created_idx += 1
-
-    return results
+    return _map_batch_create_results(pending_transactions, response.json()["data"])
 
 
 def patch_ynab_transaction_categories(
