@@ -51,7 +51,7 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed).
 3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence. After all creates, runs a settle-then-enforce category phase (see "Category enforcement" below). YNAB's batch-create response returns transactions sorted by date, not in submission order, so created IDs are matched back to their `PendingTransaction` by `import_id` (`_map_batch_create_results`) — never by list position.
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
-5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`
+5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`. Accounts marked `"skip": true` are untracked cards (e.g. company cards); receipts routed to them are recorded as processed but never imported.
 6. **Scheduled transactions**: Future dates (like autopay due dates) with "certain" confidence use YNAB's scheduled transactions API; others are capped to today
 7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata), `runs` (script execution history)
 8. **File-based logging**: Each run writes a detailed log to `logs/YYYY-MM-DD_HH-MM-SS.log` (DEBUG level). Console output is quieter (INFO level, milestones and accepted transactions only). Logs auto-prune after 90 days.
@@ -70,7 +70,7 @@ The Ready-to-Assign `category_id` is looked up once per budget and cached in `yn
 
 ## Key Data Structures
 
-- `Account`: name, ynab_id, notes, default (for multi-account routing)
+- `Account`: name, ynab_id, notes, default, skip (for multi-account routing; `skip` marks an untracked card, and `ynab_id` is `None` for skip accounts)
 - `Email`: id, subject, from_email, received_at, body
 - `ClassificationResult`: score (1-10), is_inflow, merchant, amount, currency (3-letter ISO code; non-USD values cause the email to be skipped), date, date_confidence ("certain"/"likely"/None), description, reasoning, account_name, checklist
 - `PendingTransaction`: email_id, account_id, amount, date, payee_name, memo, import_id, is_inflow, is_scheduled (used for batch creation and scheduled transactions)
@@ -123,14 +123,20 @@ Claude uses an explicit checklist to score emails, making classification stable 
 [
   {"name": "Chase Freedom", "ynab_id": "abc-123", "default": true},
   {"name": "Apple Card", "ynab_id": "def-456"},
-  {"name": "SoFi Checking", "ynab_id": "ghi-789"}
+  {"name": "SoFi Checking", "ynab_id": "ghi-789"},
+  {"name": "Company Card", "skip": true}
 ]
 ```
 
 Requirements:
-- Each account must have `name` and `ynab_id`
-- Exactly one account must have `default: true`
+- Each account must have a `name`
+- Each account must have a `ynab_id`, except accounts marked `"skip": true`
+- Exactly one account must have `"default": true`; the default cannot be a skip account
 - Account names must be unique
+
+### Untracked cards (skip accounts)
+
+An account marked `"skip": true` represents a card not tracked in YNAB (e.g. a company card). It needs no `ynab_id`, but it still needs a `.env.notes` description stating the card's last 4 digits — that is what Claude routes by, the same as for a normal account. When a receipt is routed to a skip account, the processing loop skips it: the email is recorded as processed so it does not resurface, but left in the Fastmail inbox (not archived) so it can still be acted on.
 
 ### Account descriptions in `.env.notes`:
 ```

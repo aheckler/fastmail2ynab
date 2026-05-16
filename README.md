@@ -10,7 +10,7 @@ A local Python script that automatically detects receipt emails in Fastmail and 
 4. Routes transactions to the appropriate YNAB account based on AI classification
 5. Creates unapproved transactions in YNAB in batches of 5
 6. Overrides YNAB's auto-assigned categories: outflows are left uncategorized for review, inflows are routed to "Inflow: Ready to Assign"
-7. Archives the source emails in Fastmail (moves from Inbox to Archive)
+7. Archives the source emails in Fastmail (moves from Inbox to Archive); receipts paid with an untracked card are skipped and left in the inbox instead
 8. Tracks processed emails and run history in a local SQLite database
 
 ## Setup
@@ -53,11 +53,13 @@ Edit the `YNAB_ACCOUNTS` setting in `.env`:
 [
   {"name": "Example Card", "ynab_id": "abc-123-your-account-id", "default": true},
   {"name": "Another Card", "ynab_id": "def-456-your-account-id"},
-  {"name": "Bank Checking", "ynab_id": "ghi-789-your-account-id"}
+  {"name": "Bank Checking", "ynab_id": "ghi-789-your-account-id"},
+  {"name": "Company Card", "skip": true}
 ]
 ```
 
-- Each account must have a `name` and `ynab_id`
+- Each account must have a `name`
+- Each account must have a `ynab_id`, except untracked-card accounts marked `"skip": true` (see [Untracked cards](#untracked-cards-skip-accounts))
 - Exactly one account must have `"default": true`
 - Get `ynab_id` from the YNAB URL: `app.ynab.com/.../accounts/ACCOUNT_ID_HERE`
 
@@ -150,6 +152,31 @@ Claude determines which YNAB account each transaction belongs to based on:
 3. **Email content** - e.g., "SoFi Checking" mentioned in the email
 
 If Claude can't determine the account, or the suggested account doesn't exist, the transaction goes to the default account.
+
+## Untracked cards (skip accounts)
+
+Some receipts that land in your inbox are paid with a card you do not track in YNAB — a company card, a spouse's employer benefits card, and so on. Importing those would create transactions for money that isn't in your budget.
+
+Mark such a card with `"skip": true` in `YNAB_ACCOUNTS`. A skip account needs no `ynab_id`:
+
+```json
+{"name": "Company Card", "skip": true}
+```
+
+Give it a `.env.notes` description that states its last 4 digits, exactly like a normal account:
+
+```
+Company Card:
+Employer-issued company card, Visa ending in 1234. Not tracked in YNAB.
+```
+
+When Claude routes a receipt to a skip account (using the `.env.notes` description you wrote), the script:
+
+- does **not** create a transaction in YNAB,
+- records the email as processed so it does not resurface on the next run,
+- leaves the email in your Fastmail inbox (it is **not** archived), so you can still act on it — for example, forward it for reimbursement.
+
+The default account cannot be a skip account.
 
 ## Scheduled Transactions for Future Dates
 

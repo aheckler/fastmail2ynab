@@ -25,6 +25,8 @@ The workflow:
     - If score meets threshold, extract merchant/amount/date
     - Create an unapproved transaction in YNAB (or scheduled transaction for
       future-dated bills with high confidence)
+    - Skip receipts paid with an untracked card (a YNAB_ACCOUNTS entry marked
+      "skip": true): record them as processed but leave them in the inbox
     - Archive the source emails in Fastmail after successful YNAB upload
     - Track processed emails in SQLite to avoid duplicates
     - Write detailed logs to logs/ directory (auto-pruned after 90 days)
@@ -41,7 +43,9 @@ Environment Variables (in .env file):
     ANTHROPIC_API_KEY      - Claude API key
     YNAB_TOKEN             - YNAB personal access token
     YNAB_BUDGET_ID         - Target budget UUID
-    YNAB_ACCOUNTS          - JSON array of account configurations (see .env.example)
+    YNAB_ACCOUNTS          - JSON array of account configurations (see .env.example).
+                             Entries marked "skip": true are untracked cards;
+                             receipts routed to them are skipped, not imported.
     MIN_SCORE              - Minimum AI confidence to import (default: 6)
 
 Account Descriptions (in .env.notes file):
@@ -190,10 +194,13 @@ def load_accounts(script_dir: Path) -> list["Account"]:
 
         name = acct.get("name")
         ynab_id = acct.get("ynab_id")
+        skip = bool(acct.get("skip", False))
 
         if not name:
             raise SystemExit(f"Error: YNAB_ACCOUNTS[{i}] missing 'name'") from None
-        if not ynab_id:
+        # Skip accounts (untracked cards) never create transactions, so they
+        # do not need a ynab_id. Every other account still requires one.
+        if not skip and not ynab_id:
             raise SystemExit(f"Error: YNAB_ACCOUNTS[{i}] missing 'ynab_id'") from None
 
         if name in seen_names:
@@ -209,6 +216,7 @@ def load_accounts(script_dir: Path) -> list["Account"]:
                 ynab_id=ynab_id,
                 notes=notes,
                 default=bool(acct.get("default", False)),
+                skip=skip,
             )
         )
 
@@ -219,6 +227,14 @@ def load_accounts(script_dir: Path) -> list["Account"]:
     if len(default_accounts) > 1:
         names = ", ".join(a.name for a in default_accounts)
         raise SystemExit(f"Error: Multiple default accounts: {names}") from None
+
+    # A skip account (untracked card) never receives transactions, so it
+    # cannot serve as the fallback default account.
+    skip_default = [a.name for a in accounts if a.default and a.skip]
+    if skip_default:
+        raise SystemExit(
+            f"Error: the default account cannot be a skip account: {skip_default[0]}"
+        ) from None
 
     # Abort if any account is missing notes — Claude needs them to route transactions
     missing_notes = [a.name for a in accounts if not a.notes]
@@ -384,16 +400,19 @@ class Account:
 
     Attributes:
         name: Human-readable account name (e.g., "Chase Freedom", "Apple Card").
-        ynab_id: YNAB account UUID.
+        ynab_id: YNAB account UUID, or None for skip accounts (untracked cards).
         notes: Optional description to help AI route transactions correctly.
         default: If True, this account receives transactions when no specific
             account is detected. Exactly one account must be marked as default.
+        skip: If True, this is an untracked card (e.g. a company card). Receipts
+            routed here are recorded as processed but never imported to YNAB.
     """
 
     name: str
-    ynab_id: str
+    ynab_id: str | None = None
     notes: str | None = None
     default: bool = False
+    skip: bool = False
 
 
 @dataclass
@@ -1174,9 +1193,7 @@ def fetch_recent_emails(token: str) -> list[Email]:
             "margin:",
             "padding:",
         )
-        text_is_css_dump = (
-            text_body and sum(1 for tok in css_tokens if tok in text_body) >= 3
-        )
+        text_is_css_dump = text_body and sum(1 for tok in css_tokens if tok in text_body) >= 3
         text_is_unusable = text_is_stub or text_is_css_dump
 
         if text_body and not text_is_unusable:
@@ -1373,6 +1390,26 @@ def check_api_health(
 # =============================================================================
 
 
+def _render_account_list(accounts: list[Account]) -> str:
+    """Render the ACCOUNTS section of the classification prompt.
+
+    Each account is listed by name, annotated if it is the default account or a
+    skip (untracked-card) account, and followed by its indented .env.notes
+    description. Claude routes transactions by matching this text.
+    """
+    lines: list[str] = []
+    for acct in accounts:
+        lines.append(f"- {acct.name}")
+        if acct.default:
+            lines.append("  [DEFAULT - use null to route here]")
+        if acct.skip:
+            lines.append("  [Untracked card - route receipts paid with this card here]")
+        if acct.notes:
+            # Indent notes under account name
+            lines.extend(f"  {line}" for line in acct.notes.splitlines())
+    return "\n".join(lines) if lines else "(no accounts configured)"
+
+
 def classify_email(
     email: Email,
     client: anthropic.Anthropic,
@@ -1413,15 +1450,7 @@ def classify_email(
     payee_list = "\n".join(sorted_payees[:2000])
 
     # Format account list for the prompt
-    account_lines = []
-    for acct in accounts:
-        account_lines.append(f"- {acct.name}")
-        if acct.default:
-            account_lines.append("  [DEFAULT - use null to route here]")
-        if acct.notes:
-            # Indent notes under account name
-            account_lines.extend(f"  {line}" for line in acct.notes.splitlines())
-    accounts_text = "\n".join(account_lines) if account_lines else "(no accounts configured)"
+    accounts_text = _render_account_list(accounts)
 
     # Structured prompt asking for JSON output with explicit checklist
     prompt = f"""Analyze this email and determine if it's related to a financial transaction.
@@ -1744,9 +1773,7 @@ def _map_batch_create_results(
         duplicates and for any transaction missing from the response.
     """
     id_by_import_id = {
-        t["import_id"]: t["id"]
-        for t in data.get("transactions", [])
-        if t.get("import_id")
+        t["import_id"]: t["id"] for t in data.get("transactions", []) if t.get("import_id")
     }
     duplicate_import_ids = set(data.get("duplicate_import_ids", []))
 
@@ -2026,9 +2053,7 @@ def fetch_ynab_scheduled_transactions(token: str, budget_id: str) -> list[dict]:
         timeout=30,
     )
     if not response.ok:
-        log.error(
-            "Failed to fetch scheduled transactions: %s", extract_ynab_error(response)
-        )
+        log.error("Failed to fetch scheduled transactions: %s", extract_ynab_error(response))
         return []
     return response.json()["data"]["scheduled_transactions"]
 
@@ -2327,12 +2352,8 @@ def _settle_and_enforce_categories(
 
     # Phase 5: verify via GET, find any that don't match their expected value
     log.info("Verifying categories on %d transaction(s)...", total)
-    regular_stragglers = _find_regular_stragglers(
-        token, budget_id, regular_targets, earliest_date
-    )
-    scheduled_stragglers = _find_scheduled_stragglers(
-        token, budget_id, scheduled_targets
-    )
+    regular_stragglers = _find_regular_stragglers(token, budget_id, regular_targets, earliest_date)
+    scheduled_stragglers = _find_scheduled_stragglers(token, budget_id, scheduled_targets)
 
     # Phase 6: re-patch any stragglers once; if they still don't stick, warn
     total_stragglers = len(regular_stragglers) + len(scheduled_stragglers)
@@ -2413,9 +2434,7 @@ def _find_regular_stragglers(
     for ynab_id, expected in regular_targets.items():
         actual = observed.get(ynab_id)
         if actual != expected:
-            log.debug(
-                "Straggler %s: expected category_id=%s, got %s", ynab_id, expected, actual
-            )
+            log.debug("Straggler %s: expected category_id=%s, got %s", ynab_id, expected, actual)
             stragglers[ynab_id] = expected
     return stragglers
 
@@ -2430,9 +2449,7 @@ def _find_scheduled_stragglers(
         return {}
 
     current = fetch_ynab_scheduled_transactions(token, budget_id)
-    observed = {
-        t["id"]: t.get("category_id") for t in current if t["id"] in scheduled_targets
-    }
+    observed = {t["id"]: t.get("category_id") for t in current if t["id"] in scheduled_targets}
     stragglers: dict[str, str | None] = {}
     for scheduled_id, expected in scheduled_targets.items():
         actual = observed.get(scheduled_id)
@@ -2555,6 +2572,7 @@ def _process_emails_impl(force: bool):
     created_email_ids: list[str] = []
 
     below_threshold = 0  # Count of emails below score threshold (for console summary)
+    untracked_skipped = 0  # Count of receipts skipped as paid with an untracked card
 
     for email in emails:
         # Skip emails we've already processed (unless force mode)
@@ -2638,20 +2656,6 @@ def _process_emails_impl(force: bool):
                 else:
                     log.debug("  No transaction date found, using email date: %s", transaction_date)
 
-            sign = "+" if result.is_inflow else "-"
-            log.info(
-                "  %s -- %s$%.2f -- %s",
-                result.matched_payee or result.merchant or "Unknown",
-                sign,
-                result.amount,
-                get_account_for_transaction(result.account_name, ACCOUNTS).name,
-            )
-
-            # Use Claude's matched payee if available, otherwise fall back to merchant name
-            final_payee = result.matched_payee or result.merchant or "Unknown"
-            if result.matched_payee and result.matched_payee != result.merchant:
-                log.debug("  Matched payee: '%s' -> '%s'", result.merchant, result.matched_payee)
-
             # Determine which account to use based on AI classification
             account = get_account_for_transaction(result.account_name, ACCOUNTS)
             if result.account_name and result.account_name == account.name:
@@ -2663,6 +2667,37 @@ def _process_emails_impl(force: bool):
                     result.account_name,
                     account.name,
                 )
+
+            # Skip receipts paid with an untracked card. The email is recorded
+            # as processed (so it does not resurface) but left in the inbox --
+            # it is not archived, since the user may still need to act on it.
+            if account.skip:
+                log.info(
+                    "  Skipped -- paid with untracked card (%s): %s",
+                    account.name,
+                    email.subject[:50],
+                )
+                untracked_skipped += 1
+                non_receipt_emails.append(email.id)
+                continue
+
+            # Past this point the account always has a real ynab_id: skip
+            # accounts (the only accounts without one) were filtered out above.
+            assert account.ynab_id is not None
+
+            sign = "+" if result.is_inflow else "-"
+            log.info(
+                "  %s -- %s$%.2f -- %s",
+                result.matched_payee or result.merchant or "Unknown",
+                sign,
+                result.amount,
+                account.name,
+            )
+
+            # Use Claude's matched payee if available, otherwise fall back to merchant name
+            final_payee = result.matched_payee or result.merchant or "Unknown"
+            if result.matched_payee and result.matched_payee != result.merchant:
+                log.debug("  Matched payee: '%s' -> '%s'", result.merchant, result.matched_payee)
 
             # Build memo with metadata for reference in YNAB
             memo = "Imported by fastmail2ynab"
@@ -2705,6 +2740,8 @@ def _process_emails_impl(force: bool):
     # Console summary of email processing
     if below_threshold:
         log.info("Skipped %d below threshold", below_threshold)
+    if untracked_skipped:
+        log.info("Skipped %d untracked-card receipt(s)", untracked_skipped)
 
     # Mark non-receipt emails as processed
     for email_id in non_receipt_emails:
@@ -2771,9 +2808,7 @@ def _process_emails_impl(force: bool):
                     is_inflow=txn.is_inflow,
                 )
                 log.info("  Created scheduled for %s: %s", txn.date, scheduled_id)
-                scheduled_targets[scheduled_id] = (
-                    ready_to_assign_id if txn.is_inflow else None
-                )
+                scheduled_targets[scheduled_id] = ready_to_assign_id if txn.is_inflow else None
                 mark_processed(txn.email_id, is_receipt=True, ynab_id=scheduled_id, run_id=run_id)
                 scheduled_added += 1
                 created_email_ids.append(txn.email_id)
@@ -2805,9 +2840,7 @@ def _process_emails_impl(force: bool):
                         receipts_added += 1
                         created_email_ids.append(email_id)
                         if ynab_id:
-                            regular_targets[ynab_id] = (
-                                ready_to_assign_id if pt.is_inflow else None
-                            )
+                            regular_targets[ynab_id] = ready_to_assign_id if pt.is_inflow else None
                             if earliest_date is None or pt.date < earliest_date:
                                 earliest_date = pt.date
 
