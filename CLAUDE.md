@@ -53,7 +53,7 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
 5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`. Accounts marked `"skip": true` are untracked cards (e.g. company cards); receipts routed to them are recorded as processed but never imported.
 6. **Scheduled transactions**: Future dates (like autopay due dates) with "certain" confidence use YNAB's scheduled transactions API; others are capped to today
-7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata), `runs` (script execution history)
+7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata + one-shot migration markers), `runs` (script execution history). On startup, `_process_emails_impl` runs a one-time backfill that deletes `classification_cache` rows pre-dating the `checklist_json` column, gated by a `cache_backfill_checklist_v1` marker in `ynab_sync_state`.
 8. **File-based logging**: Each run writes a detailed log to `logs/YYYY-MM-DD_HH-MM-SS.log` (DEBUG level). Console output is quieter (INFO level, milestones and accepted transactions only). Logs auto-prune after 90 days.
 
 ## Category enforcement
@@ -98,11 +98,15 @@ Claude uses an explicit checklist to score emails, making classification stable 
 | `reminder_only` | -2 | May have amount, but no transaction yet |
 | `approximate_amount` | -5 | Amount would be wrong; real receipt comes later |
 
-**Score calculation:**
+**Score calculation (deterministic, computed in code):**
 1. Start with base score of 3
 2. Add positive weights for TRUE signals
 3. Subtract negative weights for TRUE signals
 4. Clamp to range 1-10
+
+The script computes this in `compute_score()` from the checklist Claude returns. Claude is still asked to emit a `score` field in its JSON response (so its `reasoning` text stays coherent), but the code ignores it. The single source of truth for weights is the `CHECKLIST_WEIGHTS` dict in `fastmail2ynab.py`.
+
+A missing or malformed checklist (wrong key set, missing keys, extras) is treated as a parse failure: the email is skipped this run and not cached, so the next run re-classifies fresh.
 
 **Example scores:**
 - Amazon shipping (amount + merchant + shipping_only): 3 + 3 + 1 - 2 = **5**

@@ -115,14 +115,14 @@ Edit `.env` to adjust optional settings:
 
 ## How scoring works
 
-Claude scores each email from 1-10 on how confident it is that the email represents a financial transaction:
+Each email is scored 1-10 by a deterministic formula in the script. Claude fills in an 11-item checklist of positive and negative signals (e.g. "specific_amount", "confirmation_language", "marketing", "approximate_amount"), and the script applies fixed weights to compute the score:
 
 - **1-3**: Clearly not a transaction (newsletters, marketing, shipping updates without prices)
 - **4-5**: Unlikely but has some financial language
 - **6-7**: Probably a transaction but missing some details
 - **8-10**: Clearly a financial transaction with amount and merchant
 
-Emails scoring 6 or higher (by default) are imported into YNAB.
+Emails scoring 6 or higher (by default) are imported into YNAB. Computing the score in code rather than reading it from Claude's response makes scoring stable across model versions and across runs of the same email.
 
 ## Inflow vs Outflow detection
 
