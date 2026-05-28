@@ -1410,6 +1410,50 @@ def _render_account_list(accounts: list[Account]) -> str:
     return "\n".join(lines) if lines else "(no accounts configured)"
 
 
+# =============================================================================
+# Score computation
+# =============================================================================
+#
+# The classification score is a pure function of the 11-key checklist Claude
+# fills in. We compute it in code rather than reading the `score` field from
+# Claude's JSON response, because Claude has been observed to return a `score`
+# that contradicts its own checklist (e.g. Cloudflare invoices in May 2026
+# where the checklist gave 7 but Claude returned 4 or 5).
+#
+# Formula: start at 3, add positive weights for TRUE signals, subtract
+# negative weights for TRUE signals, clamp to 1-10.
+
+CHECKLIST_WEIGHTS: dict[str, int] = {
+    # Positive signals
+    "specific_amount": 3,
+    "confirmation_language": 3,
+    "transaction_date": 2,
+    "payment_method": 2,
+    "merchant_identified": 1,
+    "account_match": 1,
+    # Negative signals
+    "marketing": -5,
+    "approximate_amount": -5,
+    "balance_credit": -4,
+    "shipping_only": -2,
+    "reminder_only": -2,
+}
+
+
+def compute_score(checklist: dict[str, bool] | None) -> int | None:
+    """Compute the classification score deterministically from the checklist.
+
+    Returns the clamped score (1-10) on a usable checklist, or None if the
+    checklist is missing, has the wrong key set, or is otherwise malformed.
+    A None return is treated by the caller as a parse failure: the email is
+    skipped this run and not cached, so the next run re-classifies fresh.
+    """
+    if not checklist or set(checklist.keys()) != set(CHECKLIST_WEIGHTS.keys()):
+        return None
+    total = 3 + sum(weight for key, weight in CHECKLIST_WEIGHTS.items() if checklist[key])
+    return max(1, min(10, total))
+
+
 def classify_email(
     email: Email,
     client: anthropic.Anthropic,
