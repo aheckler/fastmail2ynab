@@ -1660,8 +1660,22 @@ Respond ONLY with valid JSON, no other text."""
         else:
             checklist = None
 
+        # Compute the score from the checklist in code; ignore Claude's `score`
+        # field, which has been observed to contradict its own checklist.
+        computed_score = compute_score(checklist)
+        log.debug(
+            "  Computed score: %s (Claude said: %s)",
+            computed_score,
+            data.get("score"),
+        )
+        if computed_score is None:
+            return ClassificationResult(
+                score=0,
+                reasoning="Failed to compute score: missing or malformed checklist",
+            )
+
         return ClassificationResult(
-            score=int(data.get("score", 0)),
+            score=computed_score,
             is_inflow=(direction == "inflow"),
             merchant=(data.get("merchant") or "").strip() or None,
             matched_payee=(data.get("matched_payee") or "").strip() or None,
@@ -2637,7 +2651,9 @@ def _process_emails_impl(force: bool):
                 # No cache hit - call Claude API and cache the result
                 result = classify_email(email, client, payee_names, ACCOUNTS)
                 # Don't cache parse failures - let them retry next run
-                if not (result.reasoning or "").startswith(("Failed to parse", "Parse error")):
+                if not (result.reasoning or "").startswith(
+                    ("Failed to parse", "Parse error", "Failed to compute")
+                ):
                     cache_classification(email.id, result)
 
             direction_str = "INFLOW" if result.is_inflow else "OUTFLOW"
