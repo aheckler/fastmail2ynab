@@ -692,6 +692,40 @@ def init_db():
         conn.commit()
 
 
+def _backfill_invalidate_pre_checklist_cache() -> None:
+    """Wipe classification_cache rows that pre-date the checklist_json column.
+
+    Old rows have checklist_json NULL because they were cached before the
+    checklist became part of the prompt. Their stored `score` was Claude's
+    self-reported number, which we no longer trust. Deleting them forces a
+    one-time re-classification under the current prompt; afterwards, every
+    cached row carries a deterministic, checklist-derived score.
+
+    Idempotent via a marker row in ynab_sync_state -- runs at most once.
+    Called from _process_emails_impl after setup_logging so the info-level
+    log message lands in the run's log file.
+    """
+    marker_key = "cache_backfill_checklist_v1"
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM ynab_sync_state WHERE key = ?", (marker_key,)
+        )
+        if cursor.fetchone() is not None:
+            return
+
+        cursor.execute(
+            "DELETE FROM classification_cache WHERE checklist_json IS NULL"
+        )
+        deleted = cursor.rowcount
+        cursor.execute(
+            "INSERT OR REPLACE INTO ynab_sync_state (key, value) VALUES (?, ?)",
+            (marker_key, "done"),
+        )
+        conn.commit()
+    log.info("Cache backfill: invalidated %d pre-checklist rows", deleted)
+
+
 def get_cached_classification(email_id: str) -> ClassificationResult | None:
     """Retrieve a cached classification result for an email.
 
@@ -2574,6 +2608,12 @@ def _process_emails_impl(force: bool):
 
     # Set up file and console logging
     setup_logging(run_id)
+
+    # One-time migration: drop classification_cache rows that pre-date the
+    # checklist_json column. Runs at most once, guarded by a marker in
+    # ynab_sync_state. Placed after setup_logging so the log line lands in
+    # the run's log file rather than being silently dropped.
+    _backfill_invalidate_pre_checklist_cache()
 
     if force:
         log.info("*** FORCE MODE: Will bypass YNAB duplicate detection ***")
