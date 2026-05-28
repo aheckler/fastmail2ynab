@@ -726,6 +726,72 @@ def _backfill_invalidate_pre_checklist_cache() -> None:
     log.info("Cache backfill: invalidated %d pre-checklist rows", deleted)
 
 
+def _backfill_recompute_cached_scores() -> None:
+    """Recompute score column for cached rows whose checklist_json is valid.
+
+    The v1 migration deleted rows with no checklist. This v2 migration handles
+    rows that have a checklist but whose stored `score` came from the old code
+    path (Claude's self-reported number, before deterministic scoring shipped).
+    It deserializes each checklist, runs compute_score, and either UPDATEs the
+    score in place or DELETEs the row if the checklist is unusable.
+
+    Idempotent via a marker row in ynab_sync_state -- runs at most once.
+    """
+    marker_key = "cache_backfill_checklist_v2"
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM ynab_sync_state WHERE key = ?", (marker_key,)
+        )
+        if cursor.fetchone() is not None:
+            return
+
+        cursor.execute(
+            "SELECT email_id, checklist_json FROM classification_cache "
+            "WHERE checklist_json IS NOT NULL"
+        )
+        rows = cursor.fetchall()
+
+        recomputed = 0
+        deleted = 0
+        for email_id, checklist_json in rows:
+            try:
+                raw = json.loads(checklist_json)
+                checklist = {k: bool(v) for k, v in raw.items()}
+            except (json.JSONDecodeError, AttributeError):
+                cursor.execute(
+                    "DELETE FROM classification_cache WHERE email_id = ?",
+                    (email_id,),
+                )
+                deleted += 1
+                continue
+
+            new_score = compute_score(checklist)
+            if new_score is None:
+                cursor.execute(
+                    "DELETE FROM classification_cache WHERE email_id = ?",
+                    (email_id,),
+                )
+                deleted += 1
+            else:
+                cursor.execute(
+                    "UPDATE classification_cache SET score = ? WHERE email_id = ?",
+                    (new_score, email_id),
+                )
+                recomputed += 1
+
+        cursor.execute(
+            "INSERT OR REPLACE INTO ynab_sync_state (key, value) VALUES (?, ?)",
+            (marker_key, "done"),
+        )
+        conn.commit()
+    log.info(
+        "Cache backfill v2: recomputed %d rows, deleted %d unusable rows",
+        recomputed,
+        deleted,
+    )
+
+
 def get_cached_classification(email_id: str) -> ClassificationResult | None:
     """Retrieve a cached classification result for an email.
 
@@ -2609,11 +2675,16 @@ def _process_emails_impl(force: bool):
     # Set up file and console logging
     setup_logging(run_id)
 
-    # One-time migration: drop classification_cache rows that pre-date the
-    # checklist_json column. Runs at most once, guarded by a marker in
-    # ynab_sync_state. Placed after setup_logging so the log line lands in
-    # the run's log file rather than being silently dropped.
-    _backfill_invalidate_pre_checklist_cache()
+    # One-time migrations on the classification_cache. Each migration is
+    # gated by its own marker in ynab_sync_state and runs at most once.
+    # Wrapped in try/except so a transient SQLite error (DB locked, etc.)
+    # doesn't abort the whole run before any email is processed; markers
+    # are only written on success, so a failed migration retries next run.
+    try:
+        _backfill_invalidate_pre_checklist_cache()
+        _backfill_recompute_cached_scores()
+    except sqlite3.Error as e:
+        log.warning("Cache backfill failed (will retry next run): %s", e)
 
     if force:
         log.info("*** FORCE MODE: Will bypass YNAB duplicate detection ***")
@@ -2690,11 +2761,19 @@ def _process_emails_impl(force: bool):
             else:
                 # No cache hit - call Claude API and cache the result
                 result = classify_email(email, client, payee_names, ACCOUNTS)
-                # Don't cache parse failures - let them retry next run
-                if not (result.reasoning or "").startswith(
+                # Parse failures (malformed JSON, missing/malformed checklist) are
+                # treated as transient: skip caching AND skip mark_processed, so
+                # the next run re-fetches and re-classifies the email.
+                is_parse_failure = (result.reasoning or "").startswith(
                     ("Failed to parse", "Parse error", "Failed to compute")
-                ):
-                    cache_classification(email.id, result)
+                )
+                if is_parse_failure:
+                    log.debug(
+                        "  Parse failure (%s); will retry next run",
+                        result.reasoning,
+                    )
+                    continue
+                cache_classification(email.id, result)
 
             direction_str = "INFLOW" if result.is_inflow else "OUTFLOW"
             log.debug(

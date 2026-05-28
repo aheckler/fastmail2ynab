@@ -53,7 +53,7 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
 5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`. Accounts marked `"skip": true` are untracked cards (e.g. company cards); receipts routed to them are recorded as processed but never imported.
 6. **Scheduled transactions**: Future dates (like autopay due dates) with "certain" confidence use YNAB's scheduled transactions API; others are capped to today
-7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata + one-shot migration markers), `runs` (script execution history). At the start of each `_process_emails_impl` call (i.e. every real run, not on `--help` or import), a one-time backfill deletes `classification_cache` rows pre-dating the `checklist_json` column. It is gated by a `cache_backfill_checklist_v1` marker in `ynab_sync_state`, so only the first real run after deployment actually deletes anything.
+7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata + one-shot migration markers), `runs` (script execution history). At the start of each `_process_emails_impl` call (every real run, not on `--help` or import), two one-time backfills run in sequence, each gated by its own marker in `ynab_sync_state` and wrapped in `try/except sqlite3.Error` so a transient SQLite failure doesn't abort the whole run: (1) `cache_backfill_checklist_v1` deletes `classification_cache` rows pre-dating the `checklist_json` column; (2) `cache_backfill_checklist_v2` recomputes the `score` column in place for rows with a valid checklist, deleting rows whose checklist is unusable. Future migrations follow the same pattern — new function, new marker key, appended to the wrapped call sequence.
 8. **File-based logging**: Each run writes a detailed log to `logs/YYYY-MM-DD_HH-MM-SS.log` (DEBUG level). Console output is quieter (INFO level, milestones and accepted transactions only). Logs auto-prune after 90 days.
 
 ## Category enforcement
@@ -106,7 +106,7 @@ Claude uses an explicit checklist to score emails, making classification stable 
 
 The script computes this in `compute_score()` from the checklist Claude returns. Claude is still asked to emit a `score` field in its JSON response (so its `reasoning` text stays coherent), but the code ignores it. The single source of truth for weights is the `CHECKLIST_WEIGHTS` dict in `fastmail2ynab.py`.
 
-A missing or malformed checklist (wrong key set, missing keys, extras) is treated as a parse failure: the email is skipped this run and not cached, so the next run re-classifies fresh.
+A missing or malformed checklist (wrong key set, missing keys, extras) is treated as a parse failure: the main loop `continue`s before `cache_classification` or `mark_processed` runs, so the email stays in the inbox and is genuinely re-classified on the next run. The same applies to JSON-decode failures and other parse errors — any `ClassificationResult` whose `reasoning` starts with `"Failed to parse"`, `"Parse error"`, or `"Failed to compute"` is treated as transient.
 
 **Example scores:**
 - Amazon shipping (amount + merchant + shipping_only): 3 + 3 + 1 - 2 = **5**
