@@ -39,6 +39,12 @@ def test_amazon_shipping_example() -> None:
     assert compute_score(checklist) == 5, compute_score(checklist)
 
 
+def test_base_score_all_false() -> None:
+    """All signals absent: base score of 3, no clamping."""
+    checklist = _checklist()
+    assert compute_score(checklist) == 3, compute_score(checklist)
+
+
 def test_school_notification_example() -> None:
     """CLAUDE.md example: merchant + reminder_only -> 2."""
     checklist = _checklist(merchant_identified=True, reminder_only=True)
@@ -128,6 +134,7 @@ def test_renamed_key_returns_none() -> None:
 def main() -> None:
     tests = [
         test_amazon_shipping_example,
+        test_base_score_all_false,
         test_school_notification_example,
         test_apple_receipt_clamps_to_10,
         test_cell_plan_renewal_example,
