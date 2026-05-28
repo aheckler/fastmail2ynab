@@ -1663,16 +1663,16 @@ Respond ONLY with valid JSON, no other text."""
         # Compute the score from the checklist in code; ignore Claude's `score`
         # field, which has been observed to contradict its own checklist.
         computed_score = compute_score(checklist)
-        log.debug(
-            "  Computed score: %s (Claude said: %s)",
-            computed_score,
-            data.get("score"),
-        )
         if computed_score is None:
             return ClassificationResult(
                 score=0,
                 reasoning="Failed to compute score: missing or malformed checklist",
             )
+        log.debug(
+            "  Computed score: %d (Claude said: %s)",
+            computed_score,
+            data.get("score"),
+        )
 
         return ClassificationResult(
             score=computed_score,
