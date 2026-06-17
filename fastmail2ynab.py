@@ -7,7 +7,11 @@
 #     "anthropic>=0.18.0",
 #     "questionary>=2.0.0",
 #     "html2text>=2024.2.26",
+#     "claude-preflight",
 # ]
+#
+# [tool.uv.sources]
+# claude-preflight = { path = "/Users/Adam/Code/claude-preflight", editable = true }
 # ///
 """
 Fastmail2YNAB - Automatically import receipt emails to YNAB.
@@ -78,6 +82,7 @@ import anthropic
 import html2text
 import questionary
 import requests
+from claude_preflight import evaluate
 from dotenv import load_dotenv
 
 # =============================================================================
@@ -252,6 +257,9 @@ def load_accounts(script_dir: Path) -> list["Account"]:
 
     return accounts
 
+
+# Claude model used for classification and preflight checks
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Script directory for config files
 SCRIPT_DIR = Path(__file__).parent
@@ -1425,33 +1433,24 @@ def archive_fastmail_emails(token: str, email_ids: list[str]) -> int:
 # =============================================================================
 
 
+def claude_preflight_or_exit() -> None:
+    """Skip the run cleanly if Claude's status preflight says the surface/model is impaired."""
+    result = evaluate([CLAUDE_MODEL], surface="api")
+    if not result.ok:
+        log.warning("Claude preflight: skipping run — %s", result.reason)
+        sys.exit(0)
+
+
 def check_api_health(
-    client: anthropic.Anthropic,
     fastmail_token: str,
     ynab_token: str,
     ynab_budget_id: str,
 ) -> None:
-    """Verify all three external APIs are reachable before doing real work.
+    """Verify Fastmail and YNAB are reachable before doing real work.
 
-    Makes lightweight requests to Anthropic, Fastmail, and YNAB. If any
-    service is unreachable, prints a helpful message and exits.
+    Claude's status is handled separately by claude_preflight_or_exit().
     """
     log.info("Checking API connectivity...")
-
-    # Anthropic
-    try:
-        client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1,
-            messages=[{"role": "user", "content": "hi"}],
-        )
-    except (
-        anthropic.APIConnectionError,
-        anthropic.APIStatusError,
-    ) as e:
-        log.error("Anthropic API is unreachable: %s", e)
-        log.error("Check https://status.anthropic.com for service status.")
-        sys.exit(1)
 
     # Fastmail
     try:
@@ -1727,7 +1726,7 @@ Rules:
 Respond ONLY with valid JSON, no other text."""
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=CLAUDE_MODEL,
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -2692,9 +2691,13 @@ def _process_emails_impl(force: bool):
     # Create Anthropic client once (reused for all emails)
     client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
 
-    # Verify all APIs are reachable before doing real work
+    # Claude status preflight (replaces the old in-health Anthropic ping). Skip
+    # cleanly on a degraded surface / model-relevant incident; a later run picks
+    # up the inbox. A bad key still surfaces on the first real classify call.
+    claude_preflight_or_exit()
+
+    # Verify Fastmail + YNAB are reachable before doing real work
     check_api_health(
-        client,
         CONFIG["fastmail_token"],
         CONFIG["ynab_token"],
         CONFIG["ynab_budget_id"],
