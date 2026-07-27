@@ -4,7 +4,7 @@
 # dependencies = [
 #     "requests>=2.31.0",
 #     "python-dotenv>=1.0.0",
-#     "anthropic>=0.18.0",
+#     "anthropic>=0.119.0",
 #     "questionary>=2.0.0",
 #     "html2text>=2024.2.26",
 #     "claude-preflight",
@@ -259,7 +259,7 @@ def load_accounts(script_dir: Path) -> list["Account"]:
 
 
 # Claude model used for classification and preflight checks
-CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MODEL = "claude-sonnet-5"
 
 # Script directory for config files
 SCRIPT_DIR = Path(__file__).parent
@@ -1727,9 +1727,16 @@ Respond ONLY with valid JSON, no other text."""
 
     message = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1024,
+        max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
+        output_config={"effort": "low"},
     )
+
+    if message.stop_reason == "max_tokens":
+        log.warning(
+            "Claude hit max_tokens before finishing its response — output is likely truncated. "
+            "Raise max_tokens or lower effort."
+        )
 
     response_text = message.content[0].text.strip()
 
