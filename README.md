@@ -99,6 +99,7 @@ Examples:
 ```bash
 # Normal run - interactively select transactions to create
 # Use Ctrl+C during selection to preview without marking emails as processed
+# Needs a real terminal: with no TTY the script stops before importing anything
 uv run fastmail2ynab.py
 
 # Reimport transactions deleted from YNAB
@@ -225,6 +226,17 @@ This ensures transactions use your existing payee names for consistent categoriz
 
 ## Troubleshooting
 
+**"1Password isn't running" / "Timed out waiting for 1Password to write .env"**
+- Only applies when `.env` is a 1Password Environments pipe instead of a regular file
+- Launch 1Password and unlock the vault, then run again
+- If 1Password is running and unlocked, check that the Environments destination for this project is still enabled
+
+**The script hangs at startup with no output and no log file**
+- Same cause as above, on a version of the script without the guard
+- Opening a named pipe for reading blocks until a writer attaches, and 1Password is the writer
+- No log appears because the `.env` load happens at import, before logging starts
+- Confirm the file type with `ls -l .env` — a leading `p` means it's a pipe
+
 **"Missing configuration"**
 - Ensure `.env` exists and all values are filled in
 
@@ -257,6 +269,11 @@ This ensures transactions use your existing payee names for consistent categoriz
 - Press Ctrl+C during transaction selection to preview without importing
 - Classifications are cached, so re-running won't call Claude again
 - Emails won't be marked as processed, so they'll reappear on the next run
+
+**"No terminal attached, so the selection prompt cannot be shown"**
+- Transaction selection is interactive and needs a real terminal, so the script stops here when stdin isn't a TTY — piped input, cron, launchd, or a non-interactive shell
+- Nothing is imported and no emails are marked as processed, so re-running from an interactive shell picks up exactly where it left off
+- Classifications from the stopped run are cached, so the re-run won't call Claude again for those emails
 
 **Emails not archiving**
 - Your Fastmail API token must have mail write access (not just read)

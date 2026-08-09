@@ -7,7 +7,11 @@
 #     "anthropic>=0.119.0",
 #     "questionary>=2.0.0",
 #     "html2text>=2024.2.26",
+#     "claude-preflight",
 # ]
+#
+# [tool.uv.sources]
+# claude-preflight = { path = "/Users/Adam/Code/claude-preflight", editable = true }
 # ///
 """Unit tests for compute_score().
 

@@ -24,6 +24,8 @@ uv run fastmail2ynab.py
 
 Dependencies are declared inline using PEP 723 script metadata, so uv handles them automatically.
 
+**The script needs a real terminal.** Transaction selection goes through `questionary`/`prompt_toolkit`, which raise an opaque `OSError` from inside the asyncio event loop when stdin isn't a TTY. `select_transactions_interactive()` guards on `sys.stdin.isatty()` and returns `None` instead, which the caller already handles as "import nothing, mark nothing." So a piped, cron, launchd, or agent-shell invocation classifies emails (caching the results) and then stops cleanly before the import phase. Don't test end-to-end behavior through a non-interactive shell; it will always stop at that point.
+
 ## CLI Flags
 
 | Flag | Description |
@@ -43,12 +45,23 @@ To test the CLI:
 uv run fastmail2ynab.py --help
 ```
 
+Four test files run standalone, no pytest needed. Each has its own PEP 723 header, which must list every dependency `fastmail2ynab.py` imports — including `claude-preflight` and its `[tool.uv.sources]` path entry. Adding an import to the script without updating all four headers breaks them with `ModuleNotFoundError`.
+
+```bash
+uv run test_compute_score.py     # score is a pure function of the checklist
+uv run test_batch_mapping.py     # batch results matched by import_id, not position
+uv run test_env_loader.py        # .env loader never hangs on the 1Password pipe
+uv run test_response_parsing.py  # response text read by block type, not position
+```
+
+Each test file imports `fastmail2ynab`, which runs `load_env_or_exit()` at import. So running any test reads the real 1Password pipe and may prompt for Touch ID. The tests themselves use scratch FIFOs and never touch the real `.env`.
+
 ## Architecture
 
 The entire application is in a single file (`fastmail2ynab.py`) with these main components:
 
 1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol (up to 200KB per body value). HTML bodies are converted to plain text with `html2text` before being passed to Claude. The `text/plain` alternative is preferred unless it's a stub ("please enable HTML") or a broken CSS-source dump (some senders, notably Shopify/Klaviyo, emit their stylesheet as plaintext); in those cases the HTML alternative is used. Archives successfully imported emails after YNAB upload.
-2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed).
+2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed). The request sets `thinking: {"type": "adaptive"}` explicitly (Sonnet 5's default, made visible in the code) and `effort: low`, so a response can contain thinking blocks ahead of the JSON. Always pull response text with `_response_text()`, which selects blocks by `.type == "text"` — never index `message.content[0]`, which is a `ThinkingBlock` whenever Claude decides to reason about an email. `max_tokens` (4096) caps thinking and response text combined.
 3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence. After all creates, runs a settle-then-enforce category phase (see "Category enforcement" below). YNAB's batch-create response returns transactions sorted by date, not in submission order, so created IDs are matched back to their `PendingTransaction` by `import_id` (`_map_batch_create_results`) — never by list position.
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
 5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`. Accounts marked `"skip": true` are untracked cards (e.g. company cards); receipts routed to them are recorded as processed but never imported.
@@ -122,6 +135,21 @@ A missing or malformed checklist (wrong key set, missing keys, extras) is treate
 - `YNAB_ACCOUNTS` - JSON array of account configurations (see below)
 - `MIN_SCORE` (default 6) - Minimum AI confidence score to import
 
+### `.env` is a 1Password pipe, not a file
+
+On Adam's machine `.env` is a UNIX named pipe mounted by 1Password Environments, not a regular file. Opening a pipe for reading blocks until a writer attaches, and 1Password is that writer. With 1Password closed, `open()` waits forever: the script hangs at import with no output and no log file, because `load_env_or_exit()` runs long before `setup_logging()`.
+
+`load_env_or_exit()` replaces the bare `load_dotenv()` call and guards each stall:
+
+1. A regular `.env` file takes the ordinary `python-dotenv` path, unchanged.
+2. Pipe present but 1Password not running (`pgrep -x 1Password`) - exit immediately, before touching the pipe.
+3. Pipe present and 1Password running - read on a daemon thread with a `ENV_FIFO_TIMEOUT_SECONDS` (30s) deadline. On timeout, exit pointing at a locked vault or disabled destination.
+4. Pipe read but no `KEY=value` lines parsed - exit with its own message.
+
+The pipe is read exactly once and the text handed to `load_dotenv(stream=...)`. It is one-shot per open: a second read returns only the comment header, so never read it twice.
+
+`load_env_or_exit()` takes an optional `env_path` purely so `test_env_loader.py` can point it at a scratch FIFO. Leave it `None` in production code.
+
 ### `YNAB_ACCOUNTS` format:
 ```json
 [
@@ -155,4 +183,4 @@ The `.env.notes` file provides detailed descriptions to help Claude route transa
 
 ## Dependencies
 
-Uses `requests` for HTTP, `anthropic` for Claude API, `python-dotenv` for env loading, `html2text` for converting HTML email bodies to plain text, `questionary` for interactive prompts. No test framework configured.
+Uses `requests` for HTTP, `anthropic` for Claude API, `python-dotenv` for env loading, `html2text` for converting HTML email bodies to plain text, `questionary` for interactive prompts, `claude-preflight` (editable, from `~/Code/claude-preflight`) for the pre-run Claude status gate. Tests are plain scripts with `assert`, run via `uv run` — no test framework.

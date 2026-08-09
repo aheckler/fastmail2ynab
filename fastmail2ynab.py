@@ -52,6 +52,10 @@ Environment Variables (in .env file):
                              receipts routed to them are skipped, not imported.
     MIN_SCORE              - Minimum AI confidence to import (default: 6)
 
+    If .env is a 1Password Environments pipe rather than a regular file, the
+    1Password desktop app must be running and unlocked. The script checks this
+    and exits with an explanation instead of blocking on the pipe.
+
 Account Descriptions (in .env.notes file):
     Detailed descriptions for each account to help AI route transactions.
     See .env.notes.example for format.
@@ -63,13 +67,17 @@ Account Descriptions (in .env.notes file):
 
 # Standard library
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -108,8 +116,121 @@ def safe_int(value: str | None, default: int) -> int:
         return default
 
 
+# Seconds to wait for 1Password to write the FIFO-backed .env before giving up.
+ENV_FIFO_TIMEOUT_SECONDS = 30
+
+
+def _one_password_running() -> bool:
+    """Check whether the 1Password desktop app is running.
+
+    Both the main app and its helper process exec as `1Password`, so a match on
+    either is a valid "1Password is up" signal.
+
+    Returns:
+        True if at least one 1Password process is running.
+    """
+    try:
+        result = subprocess.run(
+            ["/usr/bin/pgrep", "-x", "1Password"],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        # pgrep missing or unrunnable - don't block the run over a failed check.
+        return True
+    return result.returncode == 0
+
+
+def _read_fifo_with_timeout(path: Path, timeout: float) -> str | None:
+    """Read a FIFO without hanging forever when no writer attaches.
+
+    Opening a FIFO for reading blocks until some process opens it for writing.
+    The read happens on a daemon thread so a blocked open can be abandoned; the
+    thread dies with the process.
+
+    Args:
+        path: Path to the FIFO.
+        timeout: Seconds to wait before giving up.
+
+    Returns:
+        The FIFO's contents, or None if the read did not finish in time.
+
+    Raises:
+        OSError: If the read itself failed (permissions, vanished path, etc).
+    """
+    content: list[str] = []
+    error: list[BaseException] = []
+
+    def _read() -> None:
+        try:
+            with path.open(encoding="utf-8") as stream:
+                content.append(stream.read())
+        except BaseException as exc:
+            # Stashed, then re-raised on the main thread where it can be handled.
+            error.append(exc)
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    reader.join(timeout)
+
+    if error:
+        raise error[0]
+    if reader.is_alive():
+        return None
+    return content[0] if content else ""
+
+
+def load_env_or_exit(env_path: Path | None = None) -> None:
+    """Load .env, failing fast instead of hanging on a 1Password FIFO.
+
+    Adam's .env is a named pipe mounted by 1Password Environments, not a regular
+    file. If 1Password isn't running, nothing ever opens the pipe for writing and
+    the read blocks forever with no output and no log. This turns each of those
+    stalls into an immediate, actionable error.
+
+    A regular .env file takes the ordinary python-dotenv path, unchanged.
+
+    Args:
+        env_path: Path to the .env file. Defaults to the one beside this script;
+            the parameter exists so tests can point at a scratch FIFO.
+
+    Raises:
+        SystemExit: If the pipe can't be read or carries no variables.
+    """
+    if env_path is None:
+        env_path = Path(__file__).parent / ".env"
+
+    if not env_path.is_fifo():
+        load_dotenv(env_path)
+        return
+
+    if not _one_password_running():
+        raise SystemExit(
+            "Error: .env is a 1Password Environments pipe, but 1Password isn't running.\n"
+            "Launch 1Password, then retry."
+        )
+
+    # Read once. The pipe is one-shot per open - a second read returns only the
+    # comment header - so parse from the text we already have.
+    text = _read_fifo_with_timeout(env_path, ENV_FIFO_TIMEOUT_SECONDS)
+    if text is None:
+        raise SystemExit(
+            f"Error: Timed out after {ENV_FIFO_TIMEOUT_SECONDS}s waiting for "
+            "1Password to write .env.\n"
+            "Check that the vault is unlocked and the Environments destination\n"
+            "for fastmail2ynab is enabled."
+        )
+
+    if not load_dotenv(stream=io.StringIO(text)):
+        raise SystemExit(
+            "Error: 1Password wrote .env but it contains no variables.\n"
+            "Check that the Environments destination for fastmail2ynab is enabled\n"
+            "and that its item still has the expected fields."
+        )
+
+
 # Load environment variables from .env file
-load_dotenv()
+load_env_or_exit()
 
 
 def parse_env_notes(script_dir: Path) -> dict[str, str]:
@@ -716,15 +837,11 @@ def _backfill_invalidate_pre_checklist_cache() -> None:
     marker_key = "cache_backfill_checklist_v1"
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT value FROM ynab_sync_state WHERE key = ?", (marker_key,)
-        )
+        cursor.execute("SELECT value FROM ynab_sync_state WHERE key = ?", (marker_key,))
         if cursor.fetchone() is not None:
             return
 
-        cursor.execute(
-            "DELETE FROM classification_cache WHERE checklist_json IS NULL"
-        )
+        cursor.execute("DELETE FROM classification_cache WHERE checklist_json IS NULL")
         deleted = cursor.rowcount
         cursor.execute(
             "INSERT OR REPLACE INTO ynab_sync_state (key, value) VALUES (?, ?)",
@@ -748,9 +865,7 @@ def _backfill_recompute_cached_scores() -> None:
     marker_key = "cache_backfill_checklist_v2"
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT value FROM ynab_sync_state WHERE key = ?", (marker_key,)
-        )
+        cursor.execute("SELECT value FROM ynab_sync_state WHERE key = ?", (marker_key,))
         if cursor.fetchone() is not None:
             return
 
@@ -824,10 +939,8 @@ def get_cached_classification(email_id: str) -> ClassificationResult | None:
     # Parse checklist JSON if present
     checklist = None
     if row[11]:
-        try:
+        with contextlib.suppress(json.JSONDecodeError):
             checklist = json.loads(row[11])
-        except json.JSONDecodeError:
-            pass
 
     return ClassificationResult(
         score=row[0],
@@ -1553,6 +1666,17 @@ def compute_score(checklist: dict[str, bool] | None) -> int | None:
     return max(1, min(10, total))
 
 
+def _response_text(message: anthropic.types.Message) -> str:
+    """Join the text blocks of a Claude response, ignoring thinking blocks.
+
+    Sonnet 5 runs adaptive thinking by default, so `content[0]` is a
+    ThinkingBlock whenever Claude decides to reason about an email. Select
+    blocks by `.type` rather than by position. Returns "" when the response
+    carries no text block at all, which the caller treats as a parse failure.
+    """
+    return "".join(block.text for block in message.content if block.type == "text").strip()
+
+
 def classify_email(
     email: Email,
     client: anthropic.Anthropic,
@@ -1729,6 +1853,7 @@ Respond ONLY with valid JSON, no other text."""
         model=CLAUDE_MODEL,
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
+        thinking={"type": "adaptive"},  # explicit; was Sonnet 5's silent default
         output_config={"effort": "low"},
     )
 
@@ -1738,7 +1863,13 @@ Respond ONLY with valid JSON, no other text."""
             "Raise max_tokens or lower effort."
         )
 
-    response_text = message.content[0].text.strip()
+    response_text = _response_text(message)
+    if not response_text:
+        log.debug(
+            "  No text block in Claude response (stop_reason=%s, blocks=%s)",
+            message.stop_reason,
+            [block.type for block in message.content],
+        )
 
     # Parse JSON response with fallback strategies
     # Strategy 1: Direct parse (prompt asks for JSON only)
@@ -2441,17 +2572,35 @@ def select_transactions_interactive(
 
     Returns:
         List of selected transactions if user confirmed (may be empty).
-        None if user cancelled with Ctrl+C.
+        None if the selection could not be completed - either the user
+        cancelled with Ctrl+C, or there is no terminal to prompt on. The
+        caller treats both the same way: import nothing, mark nothing.
     """
     if not pending:
         return pending
 
+    # questionary/prompt_toolkit need a real terminal. Without one they raise
+    # an opaque OSError from deep inside the asyncio event loop, so check up
+    # front. Bailing out here leaves the run untouched: nothing is imported and
+    # nothing is marked processed, and the classifications cached earlier in
+    # this run mean the next interactive run reaches this point quickly.
+    if not sys.stdin.isatty():
+        log.warning(
+            "No terminal attached, so the selection prompt cannot be shown. "
+            "%d transaction(s) are ready to import - run the script from an "
+            "interactive shell to review and import them.",
+            len(pending),
+        )
+        return None
+
     # Override questionary's indicators to use clearer checkbox markers
     # Must patch in common module where they're actually used, not just constants
+    # questionary ships py.typed but doesn't re-export these module constants,
+    # so pyright flags the attribute access; the patch works at runtime.
     from questionary.prompts import common
 
-    common.INDICATOR_SELECTED = "[X]"
-    common.INDICATOR_UNSELECTED = "[ ]"
+    common.INDICATOR_SELECTED = "[X]"  # pyright: ignore[reportPrivateImportUsage]
+    common.INDICATOR_UNSELECTED = "[ ]"  # pyright: ignore[reportPrivateImportUsage]
 
     # Build choices with transaction details
     choices = []
@@ -2645,6 +2794,10 @@ def process_emails(force: bool = False):
     11. Mark emails as processed in our database
 
     Cancel (Ctrl+C) during selection to preview without marking emails as processed.
+
+    Step 9 requires a terminal. With no TTY on stdin (a pipe, cron, launchd, or
+    a non-interactive shell) the script logs a warning and stops there rather
+    than importing anything, so it is safe to invoke non-interactively.
 
     Args:
         force: If True, reprocess all emails even if already in processed_emails,
@@ -2945,8 +3098,9 @@ def _process_emails_impl(force: bool):
     result = select_transactions_interactive(pending_transactions, transaction_display_data)
 
     if result is None:
-        # User cancelled with Ctrl+C - don't mark anything as processed (preview mode)
-        log.info("Cancelled. No emails marked as processed.")
+        # Ctrl+C (preview mode) or no TTY to prompt on. Either way, don't mark
+        # anything as processed, so the next run re-offers these transactions.
+        log.info("No emails marked as processed.")
         return
 
     pending_transactions = result
@@ -3020,7 +3174,9 @@ def _process_emails_impl(force: bool):
                     budget_id=CONFIG["ynab_budget_id"],
                     pending_transactions=batch,
                 )
-                for (email_id, ynab_id, already_existed), pt in zip(results, batch):
+                # strict=True: _map_batch_create_results returns exactly one
+                # result per submitted transaction, in submission order.
+                for (email_id, ynab_id, already_existed), pt in zip(results, batch, strict=True):
                     if already_existed:
                         log.info("  Already exists in YNAB (duplicate)")
                         duplicates += 1
