@@ -51,7 +51,7 @@ Four test files run standalone, no pytest needed. Each has its own PEP 723 heade
 uv run test_compute_score.py     # score is a pure function of the checklist
 uv run test_batch_mapping.py     # batch results matched by import_id, not position
 uv run test_env_loader.py        # .env loader never hangs on the 1Password pipe
-uv run test_response_parsing.py  # response text read by block type, not position
+uv run test_response_parsing.py  # text read by block type; refusal/max_tokens/parse-failure handling
 ```
 
 Each test file imports `fastmail2ynab`, which runs `load_env_or_exit()` at import. So running any test reads the real 1Password pipe and may prompt for Touch ID. The tests themselves use scratch FIFOs and never touch the real `.env`.
@@ -61,7 +61,7 @@ Each test file imports `fastmail2ynab`, which runs `load_env_or_exit()` at impor
 The entire application is in a single file (`fastmail2ynab.py`) with these main components:
 
 1. **Fastmail JMAP integration**: Fetches recent emails using the JMAP protocol (up to 200KB per body value). HTML bodies are converted to plain text with `html2text` before being passed to Claude. The `text/plain` alternative is preferred unless it's a stub ("please enable HTML") or a broken CSS-source dump (some senders, notably Shopify/Klaviyo, emit their stylesheet as plaintext); in those cases the HTML alternative is used. Archives successfully imported emails after YNAB upload.
-2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed). The request sets `thinking: {"type": "adaptive"}` explicitly (Sonnet 5's default, made visible in the code) and `effort: low`, so a response can contain thinking blocks ahead of the JSON. Always pull response text with `_response_text()`, which selects blocks by `.type == "text"` — never index `message.content[0]`, which is a `ThinkingBlock` whenever Claude decides to reason about an email. `max_tokens` (4096) caps thinking and response text combined.
+2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed). The model is `CLAUDE_MODEL` (Claude Sonnet 5.5). The request uses structured outputs (`output_config.format` with `CLASSIFICATION_SCHEMA`, whose checklist keys are built from `CHECKLIST_WEIGHTS`), so a successful response is schema-valid JSON with nothing to extract; there is no regex fallback. It sets `thinking: {"type": "adaptive"}` explicitly (also the model's default) and `effort: high`, so a response can contain thinking blocks ahead of the JSON. Always pull response text with `_response_text()`, which selects blocks by `.type == "text"` — never index `message.content[0]`, which is a `ThinkingBlock` whenever Claude decides to reason about an email. `max_tokens` (16000) caps thinking and response text combined. `_classification_from_message()` checks `stop_reason` before reading content (see "Classification Checklist" below for how each outcome is handled).
 3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence. After all creates, runs a settle-then-enforce category phase (see "Category enforcement" below). YNAB's batch-create response returns transactions sorted by date, not in submission order, so created IDs are matched back to their `PendingTransaction` by `import_id` (`_map_batch_create_results`) — never by list position.
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations
 5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`. Accounts marked `"skip": true` are untracked cards (e.g. company cards); receipts routed to them are recorded as processed but never imported.
@@ -120,6 +120,11 @@ Claude uses an explicit checklist to score emails, making classification stable 
 The script computes this in `compute_score()` from the checklist Claude returns. Claude is still asked to emit a `score` field in its JSON response (so its `reasoning` text stays coherent), but the code ignores it. The single source of truth for weights is the `CHECKLIST_WEIGHTS` dict in `fastmail2ynab.py`.
 
 A missing or malformed checklist (wrong key set, missing keys, extras) is treated as a parse failure: the main loop `continue`s before `cache_classification` or `mark_processed` runs, so the email stays in the inbox and is genuinely re-classified on the next run. The same applies to JSON-decode failures and other parse errors — any `ClassificationResult` whose `reasoning` starts with `"Failed to parse"`, `"Parse error"`, or `"Failed to compute"` is treated as transient.
+
+Two `stop_reason` values are handled before any parsing:
+
+- `"max_tokens"`: the response is treated as failed even if its text parses (reasoning `"Failed to parse: response hit max_tokens"`), so it is transient and retried next run.
+- `"refusal"`: a Sonnet 5.5 safety classifier declined the email. The result is score 0 with reasoning `"Refused by Claude (<category>)"` and a console WARNING. This is deliberately *not* transient: it is cached and marked processed (left in the inbox, not archived), so a refused email isn't re-sent on every run. There is no server-side fallback model.
 
 **Example scores:**
 - Amazon shipping (amount + merchant + shipping_only): 3 + 3 + 1 - 2 = **5**

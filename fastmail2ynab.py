@@ -380,7 +380,7 @@ def load_accounts(script_dir: Path) -> list["Account"]:
 
 
 # Claude model used for classification and preflight checks
-CLAUDE_MODEL = "claude-sonnet-5"
+CLAUDE_MODEL = "claude-sonnet-5-5"
 
 # Script directory for config files
 SCRIPT_DIR = Path(__file__).parent
@@ -1652,6 +1652,55 @@ CHECKLIST_WEIGHTS: dict[str, int] = {
 }
 
 
+def _nullable(schema: dict[str, object]) -> dict[str, object]:
+    """Allow `null` alongside a JSON schema type (structured outputs use anyOf)."""
+    return {"anyOf": [schema, {"type": "null"}]}
+
+
+# JSON schema passed to Claude as `output_config.format` (structured outputs),
+# so every successful response is schema-valid JSON with nothing to extract.
+# The checklist keys come from CHECKLIST_WEIGHTS so the two can't drift.
+# Structured outputs reject numeric bounds (minimum/maximum); code clamps the
+# score and validates the rest.
+CLASSIFICATION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "checklist": {
+            "type": "object",
+            "properties": {key: {"type": "boolean"} for key in CHECKLIST_WEIGHTS},
+            "required": list(CHECKLIST_WEIGHTS),
+            "additionalProperties": False,
+        },
+        "score": {"type": "integer"},
+        "direction": {"type": "string", "enum": ["inflow", "outflow"]},
+        "merchant": _nullable({"type": "string"}),
+        "matched_payee": _nullable({"type": "string"}),
+        "account_name": _nullable({"type": "string"}),
+        "amount": _nullable({"type": "number"}),
+        "currency": _nullable({"type": "string"}),
+        "date": _nullable({"type": "string", "format": "date"}),
+        "date_confidence": _nullable({"type": "string", "enum": ["certain", "likely"]}),
+        "description": {"type": "string"},
+        "reasoning": {"type": "string"},
+    },
+    "required": [
+        "checklist",
+        "score",
+        "direction",
+        "merchant",
+        "matched_payee",
+        "account_name",
+        "amount",
+        "currency",
+        "date",
+        "date_confidence",
+        "description",
+        "reasoning",
+    ],
+    "additionalProperties": False,
+}
+
+
 def compute_score(checklist: dict[str, bool] | None) -> int | None:
     """Compute the classification score deterministically from the checklist.
 
@@ -1669,8 +1718,8 @@ def compute_score(checklist: dict[str, bool] | None) -> int | None:
 def _response_text(message: anthropic.types.Message) -> str:
     """Join the text blocks of a Claude response, ignoring thinking blocks.
 
-    Sonnet 5 runs adaptive thinking by default, so `content[0]` is a
-    ThinkingBlock whenever Claude decides to reason about an email. Select
+    The request runs adaptive thinking, so `content[0]` is a ThinkingBlock
+    whenever Claude decides to reason about an email. Select
     blocks by `.type` rather than by position. Returns "" when the response
     carries no text block at all, which the caller treats as a parse failure.
     """
@@ -1801,7 +1850,7 @@ Then extract the amount using these rules:
 
 The `amount` you return must be denominated in the currency you report. Do not convert between currencies.
 
-Respond with JSON in this exact format:
+Respond with JSON in this format (values are illustrative):
 {{
   "checklist": {{
     "specific_amount": true,
@@ -1830,7 +1879,6 @@ Respond with JSON in this exact format:
 }}
 
 Rules:
-- "checklist" must contain all 11 boolean fields
 - "score" must be an integer from 1-10, calculated using the formula above
 - "direction" must be either "inflow" or "outflow"
 - "amount" must be the TOTAL amount charged to the payment method — including tax, tips, fees, and surcharges. If the email shows both a subtotal and a total, always use the total. Must be a positive number (no currency symbols), or null if not found. See the CURRENCY section above for which amount to pick when multiple currencies are present.
@@ -1845,45 +1893,70 @@ Rules:
 - "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "Co.", etc. Only use a value from the provided list.
 - "account_name" should be the EXACT name from the ACCOUNTS list that this transaction belongs to based on the account descriptions. Use null to route to the default account. Only use a value from the provided list.
 - Account descriptions may list "last 4" digits for an account number and/or a debit/credit card. If the email references an account or card ending in any of an account's listed last-4 values, that is a definitive routing match — use that account. Do not invent a digit-to-account mapping that is not explicitly stated; if the email's digits match no listed value, ignore them and route using the rest of the descriptions.
-- "description" should briefly describe the transaction
-
-Respond ONLY with valid JSON, no other text."""
+- "description" should briefly describe the transaction"""
 
     message = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        # Thinking counts toward max_tokens even though its text isn't returned.
+        max_tokens=16000,
         messages=[{"role": "user", "content": prompt}],
-        thinking={"type": "adaptive"},  # explicit; was Sonnet 5's silent default
-        output_config={"effort": "low"},
+        thinking={"type": "adaptive"},  # explicit; also the model's default
+        output_config={
+            "effort": "high",
+            "format": {"type": "json_schema", "schema": CLASSIFICATION_SCHEMA},
+        },
     )
+    return _classification_from_message(message, email.subject)
+
+
+def _classification_from_message(
+    message: anthropic.types.Message, subject: str
+) -> ClassificationResult:
+    """Turn a Claude classification response into a ClassificationResult.
+
+    Checks `stop_reason` before reading any content:
+
+    - "refusal": a safety classifier declined the email. Returns score 0 with
+      reasoning "Refused by Claude (<category>)". That is deliberately not a
+      transient-failure prefix, so the caller caches it and marks the email
+      processed (it stays in the inbox) instead of re-sending it every run.
+    - "max_tokens": the response was cut off, so it is treated as failed even
+      if the text happens to parse. Returns a "Failed to parse" result, which
+      the caller treats as transient and retries next run.
+
+    Otherwise the text is the JSON that `output_config.format` guarantees.
+    Any `reasoning` starting with "Failed to parse", "Parse error", or
+    "Failed to compute" marks a transient failure.
+    """
+    if message.stop_reason == "refusal":
+        category = message.stop_details.category if message.stop_details else None
+        log.warning(
+            "  Claude declined to classify (category: %s): %s",
+            category or "unknown",
+            subject[:50],
+        )
+        return ClassificationResult(
+            score=0, reasoning=f"Refused by Claude ({category or 'unknown'})"
+        )
 
     if message.stop_reason == "max_tokens":
-        log.warning(
-            "Claude hit max_tokens before finishing its response — output is likely truncated. "
-            "Raise max_tokens or lower effort."
-        )
+        log.warning("  Claude hit max_tokens; will retry next run: %s", subject[:50])
+        return ClassificationResult(score=0, reasoning="Failed to parse: response hit max_tokens")
 
     response_text = _response_text(message)
-    if not response_text:
-        log.debug(
-            "  No text block in Claude response (stop_reason=%s, blocks=%s)",
-            message.stop_reason,
-            [block.type for block in message.content],
-        )
-
-    # Parse JSON response with fallback strategies
-    # Strategy 1: Direct parse (prompt asks for JSON only)
     try:
         data = json.loads(response_text)
     except json.JSONDecodeError:
-        # Strategy 2: Extract JSON block if wrapped in markdown or other text
-        json_match = re.search(r"\{[\s\S]*\}", response_text)
-        if not json_match:
-            return ClassificationResult(score=0, reasoning="Failed to parse response")
-        try:
-            data = json.loads(json_match.group())
-        except json.JSONDecodeError:
-            return ClassificationResult(score=0, reasoning="Failed to parse JSON from response")
+        log.debug(
+            "  Unparseable Claude response (stop_reason=%s, blocks=%s)",
+            message.stop_reason,
+            [block.type for block in message.content],
+        )
+        return ClassificationResult(score=0, reasoning="Failed to parse JSON from response")
+    if not isinstance(data, dict):
+        return ClassificationResult(
+            score=0, reasoning="Failed to parse: response is not a JSON object"
+        )
 
     # Convert parsed JSON to ClassificationResult
     try:
@@ -1919,7 +1992,8 @@ Respond ONLY with valid JSON, no other text."""
             amount=float(data["amount"]) if data.get("amount") else None,
             currency=(data.get("currency") or "").strip().upper() or None,
             date=data.get("date"),
-            date_confidence=data.get("date_confidence"),
+            # Structured outputs don't guarantee enum casing; callers compare "certain".
+            date_confidence=(data.get("date_confidence") or "").lower() or None,
             description=data.get("description"),
             reasoning=data.get("reasoning"),
             account_name=data.get("account_name"),
