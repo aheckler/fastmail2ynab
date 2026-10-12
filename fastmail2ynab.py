@@ -1546,9 +1546,16 @@ def archive_fastmail_emails(token: str, email_ids: list[str]) -> int:
 # =============================================================================
 
 
+PREFLIGHT_JOB = (
+    "Manual command-line job on macOS that calls the Claude API directly with an API key. "
+    "Uses structured outputs and adaptive thinking. No tool use, prompt caching, streaming, "
+    "Message Batches, Files API, or image or PDF input."
+)
+
+
 def claude_preflight_or_exit() -> None:
     """Skip the run cleanly if Claude's status preflight says the surface/model is impaired."""
-    result = evaluate([CLAUDE_MODEL], surface="api")
+    result = evaluate([CLAUDE_MODEL], surface="api", job=PREFLIGHT_JOB)
     if not result.ok:
         log.warning("Claude preflight: skipping run — %s", result.reason)
         sys.exit(0)
