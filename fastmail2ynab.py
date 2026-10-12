@@ -1549,7 +1549,7 @@ def archive_fastmail_emails(token: str, email_ids: list[str]) -> int:
 PREFLIGHT_JOB = (
     "Manual command-line job on macOS that calls the Claude API directly with an API key. "
     "Uses structured outputs and adaptive thinking. No tool use, prompt caching, streaming, "
-    "Message Batches, Files API, or image or PDF input."
+    "Message Batches, Files API, or image or PDF input. Account billing is in good standing."
 )
 
 
