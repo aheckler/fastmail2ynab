@@ -90,7 +90,7 @@ import anthropic
 import html2text
 import questionary
 import requests
-from claude_preflight import evaluate
+from claude_preflight import check
 from dotenv import load_dotenv
 
 # =============================================================================
@@ -379,7 +379,7 @@ def load_accounts(script_dir: Path) -> list["Account"]:
     return accounts
 
 
-# Claude model used for classification and preflight checks
+# Claude model used for classification
 CLAUDE_MODEL = "claude-sonnet-5-5"
 
 # Script directory for config files
@@ -1546,16 +1546,9 @@ def archive_fastmail_emails(token: str, email_ids: list[str]) -> int:
 # =============================================================================
 
 
-PREFLIGHT_JOB = (
-    "Manual command-line job on macOS that calls the Claude API directly with an API key. "
-    "Uses structured outputs and adaptive thinking. No tool use, prompt caching, streaming, "
-    "Message Batches, Files API, or image or PDF input. Account billing is in good standing."
-)
-
-
 def claude_preflight_or_exit() -> None:
-    """Skip the run cleanly if Claude's status preflight says the surface/model is impaired."""
-    result = evaluate([CLAUDE_MODEL], surface="api", job=PREFLIGHT_JOB)
+    """Skip the run cleanly if Claude has an open incident and Adam declines to run anyway."""
+    result = check()
     if not result.ok:
         log.warning("Claude preflight: skipping run — %s", result.reason)
         sys.exit(0)
@@ -2932,9 +2925,9 @@ def _process_emails_impl(force: bool):
     # Create Anthropic client once (reused for all emails)
     client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
 
-    # Claude status preflight (replaces the old in-health Anthropic ping). Skip
-    # cleanly on a degraded surface / model-relevant incident; a later run picks
-    # up the inbox. A bad key still surfaces on the first real classify call.
+    # Claude status preflight (replaces the old in-health Anthropic ping). With
+    # an open incident it asks whether to run anyway; a later run picks up the
+    # inbox. A bad key still surfaces on the first real classify call.
     claude_preflight_or_exit()
 
     # Verify Fastmail + YNAB are reachable before doing real work
