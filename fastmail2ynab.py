@@ -90,7 +90,7 @@ import anthropic
 import html2text
 import questionary
 import requests
-from claude_preflight import check
+from claude_preflight import api_error_kind, check
 from dotenv import load_dotenv
 
 # =============================================================================
@@ -2980,7 +2980,7 @@ def _process_emails_impl(force: bool):
     below_threshold = 0  # Count of emails below score threshold (for console summary)
     untracked_skipped = 0  # Count of receipts skipped as paid with an untracked card
 
-    for email in emails:
+    for index, email in enumerate(emails):
         # Skip emails we've already processed (unless force mode)
         if not force and is_processed(email.id):
             log.debug("Already processed: %s", email.subject[:50])
@@ -2997,7 +2997,23 @@ def _process_emails_impl(force: bool):
                 cached += 1
             else:
                 # No cache hit - call Claude API and cache the result
-                result = classify_email(email, client, payee_names, ACCOUNTS)
+                try:
+                    result = classify_email(email, client, payee_names, ACCOUNTS)
+                except Exception as e:
+                    # An outage or auth error stops every further Claude call this
+                    # run. This email and the rest stay uncached and unprocessed, so
+                    # the next run picks them up; anything else is a per-email error.
+                    kind = api_error_kind(e)
+                    if kind is None:
+                        raise
+                    left = sum(1 for e2 in emails[index:] if force or not is_processed(e2.id))
+                    log.warning(
+                        "Claude API %s (%s); stopped classifying, %d email(s) left for the next run",
+                        kind,
+                        type(e).__name__,
+                        left,
+                    )
+                    break
                 # Parse failures (malformed JSON, missing/malformed checklist) are
                 # treated as transient: skip caching AND skip mark_processed, so
                 # the next run re-fetches and re-classifies the email.

@@ -45,13 +45,14 @@ To test the CLI:
 uv run fastmail2ynab.py --help
 ```
 
-Four test files run standalone, no pytest needed. Each has its own PEP 723 header, which must list every dependency `fastmail2ynab.py` imports — including `claude-preflight` and its `[tool.uv.sources]` path entry. Adding an import to the script without updating all four headers breaks them with `ModuleNotFoundError`.
+Five test files run standalone, no pytest needed. Each has its own PEP 723 header, which must list every dependency `fastmail2ynab.py` imports — including `claude-preflight` and its `[tool.uv.sources]` path entry. Adding an import to the script without updating all five headers breaks them with `ModuleNotFoundError`.
 
 ```bash
 uv run test_compute_score.py     # score is a pure function of the checklist
 uv run test_batch_mapping.py     # batch results matched by import_id, not position
 uv run test_env_loader.py        # .env loader never hangs on the 1Password pipe
 uv run test_response_parsing.py  # text read by block type; refusal/max_tokens/parse-failure handling
+uv run test_api_outage.py        # an outage mid-run stops Claude calls and leaves the rest for next run
 ```
 
 Each test file imports `fastmail2ynab`, which runs `load_env_or_exit()` at import. So running any test reads the real 1Password pipe and may prompt for Touch ID. The tests themselves use scratch FIFOs and never touch the real `.env`.
@@ -125,6 +126,8 @@ Two `stop_reason` values are handled before any parsing:
 
 - `"max_tokens"`: the response is treated as failed even if its text parses (reasoning `"Failed to parse: response hit max_tokens"`), so it is transient and retried next run.
 - `"refusal"`: a Sonnet 5.5 safety classifier declined the email. The result is score 0 with reasoning `"Refused by Claude (<category>)"` and a console WARNING. This is deliberately *not* transient: it is cached and marked processed (left in the inbox, not archived), so a refused email isn't re-sent on every run. There is no server-side fallback model.
+
+An API exception from `classify_email()` is never cached or marked processed. If `claude_preflight.api_error_kind()` calls it an outage (connection error, timeout, 429, 5xx, 529) or an auth error (401, 403), the loop logs one WARNING with the number of emails left and stops calling Claude for the rest of the run. Emails classified before the failure are kept, and the run continues to the review step with them. Any other exception is a per-email error, as before.
 
 **Example scores:**
 - Amazon shipping (amount + merchant + shipping_only): 3 + 3 + 1 - 2 = **5**
