@@ -218,6 +218,8 @@ When classifying emails, Claude matches the extracted merchant name to your exis
 
 This ensures transactions use your existing payee names for consistent categorization and reporting.
 
+YNAB's internal payees (`Transfer : <account>`, `Starting Balance`, and the balance-adjustment payees) are never offered for matching. The YNAB API rejects them as a payee name, so a credit card payment imports as an ordinary transaction (for example, payee `ELAN`). Link it to the matching transfer in YNAB yourself.
+
 ## Costs
 
 **Claude API:**
@@ -252,6 +254,7 @@ This ensures transactions use your existing payee names for consistent categoriz
 **YNAB 400 errors**
 - Check that your budget ID and account IDs are correct
 - Verify your YNAB token hasn't expired
+- YNAB rejects a whole batch when one transaction in it is invalid; the script then retries that batch one transaction at a time, so only the invalid one fails. The log names its payee
 
 **Duplicate transactions**
 - The `import_id` prevents duplicates in YNAB

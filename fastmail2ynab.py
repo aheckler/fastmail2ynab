@@ -417,6 +417,15 @@ DB_PATH = Path(__file__).parent / "processed_emails.db"
 FASTMAIL_JMAP_URL = "https://api.fastmail.com/jmap/session"  # JMAP session endpoint
 YNAB_BASE_URL = "https://api.ynab.com/v1"  # YNAB REST API base
 
+# YNAB rejects any payee_name starting with one of these. Transfers can only
+# be created by payee_id, so these payees are never offered to Claude.
+YNAB_INTERNAL_PAYEE_PREFIXES = (
+    "Transfer : ",
+    "Starting Balance",
+    "Manual Balance Adjustment",
+    "Reconciliation Balance Adjustment",
+)
+
 # Log directory
 LOG_DIR = Path(__file__).parent / "logs"
 
@@ -2570,16 +2579,27 @@ def cache_ynab_payees(payees: list[dict], server_knowledge: int):
         conn.commit()
 
 
+def is_internal_payee(name: str) -> bool:
+    """Check whether a payee name is one YNAB reserves (transfers, balances)."""
+    return name.strip().startswith(YNAB_INTERNAL_PAYEE_PREFIXES)
+
+
 def get_cached_payees() -> list[str]:
-    """Get list of cached payee names (non-deleted only).
+    """Get list of cached payee names (non-deleted, non-internal only).
+
+    Transfer payees and YNAB's balance payees are excluded: YNAB rejects
+    them as a payee_name, so Claude must never match to them.
 
     Returns:
         List of payee name strings from the local cache.
     """
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT name FROM ynab_payees WHERE deleted = 0")
-        return [row[0].strip() for row in cursor.fetchall()]
+        cursor.execute(
+            "SELECT name FROM ynab_payees WHERE deleted = 0 AND transfer_account_id IS NULL"
+        )
+        names = [row[0].strip() for row in cursor.fetchall()]
+    return [name for name in names if not is_internal_payee(name)]
 
 
 def is_payee_cache_stale() -> bool:
@@ -2697,6 +2717,70 @@ def select_transactions_interactive(
         return None
 
     return [txn for txn in pending if txn.email_id in selected_ids]
+
+
+def _create_regular_batch(
+    batch: list[PendingTransaction],
+) -> tuple[list[tuple[tuple[str, str | None, bool], PendingTransaction]], int]:
+    """Create a batch of regular transactions, isolating any invalid one.
+
+    YNAB rejects a whole batch with a 400 when any one transaction in it is
+    invalid. On a 400 this retries each transaction on its own, so the valid
+    ones still land and only the bad one fails.
+
+    Args:
+        batch: Pending regular transactions to create.
+
+    Returns:
+        Tuple of (created, failed): created pairs each create result
+        (email_id, transaction_id, already_existed) with its transaction;
+        failed counts transactions that could not be created.
+
+    Raises:
+        requests.HTTPError: For a non-400 failure of the batch request.
+    """
+    try:
+        results = create_ynab_transactions_batch(
+            token=CONFIG["ynab_token"],
+            budget_id=CONFIG["ynab_budget_id"],
+            pending_transactions=batch,
+        )
+        # strict=True: _map_batch_create_results returns exactly one
+        # result per submitted transaction, in submission order.
+        return list(zip(results, batch, strict=True)), 0
+    except requests.HTTPError as e:
+        if e.response is None or e.response.status_code != 400 or len(batch) == 1:
+            raise
+        log.warning("Batch rejected; retrying its %d transaction(s) one at a time", len(batch))
+
+    created: list[tuple[tuple[str, str | None, bool], PendingTransaction]] = []
+    failed = 0
+    for index, pt in enumerate(batch):
+        try:
+            [result] = create_ynab_transactions_batch(
+                token=CONFIG["ynab_token"],
+                budget_id=CONFIG["ynab_budget_id"],
+                pending_transactions=[pt],
+            )
+            created.append((result, pt))
+        except Exception as e:
+            log.debug("Traceback:\n%s", traceback.format_exc())
+            is_invalid = (
+                isinstance(e, requests.HTTPError)
+                and e.response is not None
+                and e.response.status_code == 400
+            )
+            if is_invalid:
+                log.error("Error creating transaction for '%s': %s", pt.payee_name, e)
+                failed += 1
+                continue
+            # Anything but a 400 (rate limit, outage, network) is not this
+            # transaction's fault, so stop retrying instead of hammering YNAB.
+            remaining = len(batch) - index
+            log.error("YNAB error while retrying; skipping %d transaction(s): %s", remaining, e)
+            failed += remaining
+            break
+    return created, failed
 
 
 SETTLE_DELAY_SECONDS = 10
@@ -3117,17 +3201,31 @@ def _process_emails_impl(force: bool):
             # accounts (the only accounts without one) were filtered out above.
             assert account.ynab_id is not None
 
+            # Use Claude's matched payee if available, otherwise fall back to merchant name.
+            # A reserved YNAB payee (e.g. a cached match from before transfer payees
+            # were hidden) would fail the whole batch, so fall back to the merchant.
+            proposed_payee = result.matched_payee or result.merchant or "Unknown"
+            final_payee = next(
+                p
+                for p in (result.matched_payee, result.merchant, "Unknown")
+                if p and not is_internal_payee(p)
+            )
+            if final_payee != proposed_payee:
+                log.warning(
+                    "  Payee '%s' is reserved by YNAB; using '%s' instead",
+                    proposed_payee,
+                    final_payee,
+                )
+
             sign = "+" if result.is_inflow else "-"
             log.info(
                 "  %s -- %s$%.2f -- %s",
-                result.matched_payee or result.merchant or "Unknown",
+                final_payee,
                 sign,
                 result.amount,
                 account.name,
             )
 
-            # Use Claude's matched payee if available, otherwise fall back to merchant name
-            final_payee = result.matched_payee or result.merchant or "Unknown"
             if result.matched_payee and result.matched_payee != result.merchant:
                 log.debug("  Matched payee: '%s' -> '%s'", result.merchant, result.matched_payee)
 
@@ -3259,14 +3357,9 @@ def _process_emails_impl(force: bool):
             log.debug("Batch %d: %d transactions", i // batch_size + 1, len(batch))
 
             try:
-                results = create_ynab_transactions_batch(
-                    token=CONFIG["ynab_token"],
-                    budget_id=CONFIG["ynab_budget_id"],
-                    pending_transactions=batch,
-                )
-                # strict=True: _map_batch_create_results returns exactly one
-                # result per submitted transaction, in submission order.
-                for (email_id, ynab_id, already_existed), pt in zip(results, batch, strict=True):
+                created, failed = _create_regular_batch(batch)
+                errors += failed
+                for (email_id, ynab_id, already_existed), pt in created:
                     if already_existed:
                         log.info("  Already exists in YNAB (duplicate)")
                         duplicates += 1
