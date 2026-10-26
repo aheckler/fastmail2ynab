@@ -218,13 +218,17 @@ When classifying emails, Claude matches the extracted merchant name to your exis
 
 This ensures transactions use your existing payee names for consistent categorization and reporting.
 
+Claude sees at most 3,000 payees, taken in sorted order. If your budget has more, the payees at the end of the list can't be matched, and receipts from those merchants import under a new payee name. The run log shows a warning when this happens. Raise `MAX_PROMPT_PAYEES` in the script, or delete or combine payees in YNAB that you no longer use.
+
 YNAB's internal payees (`Transfer : <account>`, `Starting Balance`, and the balance-adjustment payees) are never offered for matching. The YNAB API rejects them as a payee name, so a credit card payment imports as an ordinary transaction (for example, payee `ELAN`). Link it to the matching transfer in YNAB yourself.
 
 ## Costs
 
 **Claude API:**
-- ~$0.003-0.015 per email (depending on length)
-- At 10 receipts/day: ~$1-5/month
+- About $0.005-0.02 per email classified, depending on the email's length
+- The first call in a run also writes the payee list, account notes, and rules (about 22k tokens) to the prompt cache, for about $0.05. Later calls in the same run read them back for about $0.002 each.
+- Each email is classified once; results are cached locally
+- A typical run of about 15 new emails costs around $0.20
 
 ## Troubleshooting
 

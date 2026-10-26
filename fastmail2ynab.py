@@ -382,6 +382,16 @@ def load_accounts(script_dir: Path) -> list["Account"]:
 # Claude model used for classification
 CLAUDE_MODEL = "claude-sonnet-5-5"
 
+# Most YNAB payees offered to Claude for matching. The list is sorted and cut
+# here, so once the budget has more payees than this, the ones at the end of
+# the sort (lowercase-first names, then Z, Y, ...) silently stop matching:
+# Claude returns no match and the import uses its raw merchant name, which
+# creates a duplicate payee in YNAB. The run logs a WARNING when that happens.
+# Raised from 2000 to 3000 in Oct 2026 at ~1,940 payees. A better long-term fix
+# is to send only payees used in recent transactions instead of cutting by
+# alphabet, since merchants not bought from in years are wasted tokens.
+MAX_PROMPT_PAYEES = 3000
+
 # Script directory for config files
 SCRIPT_DIR = Path(__file__).parent
 
@@ -1606,8 +1616,9 @@ def check_api_health(
 # 1. Is this email about a financial transaction? (score 1-10)
 # 2. If so, extract: merchant, amount, date, direction (inflow/outflow)
 #
-# The prompt asks for JSON output with a specific schema. We parse with
-# fallback handling in case Claude wraps JSON in markdown or other text.
+# Structured outputs constrain the response to CLASSIFICATION_SCHEMA. The
+# prompt is split for caching: payees, accounts, and rules form a static
+# system block shared by every call in a run, and the email is the user turn.
 # =============================================================================
 
 
@@ -1629,6 +1640,149 @@ def _render_account_list(accounts: list[Account]) -> str:
             # Indent notes under account name
             lines.extend(f"  {line}" for line in acct.notes.splitlines())
     return "\n".join(lines) if lines else "(no accounts configured)"
+
+
+def _classification_system_prompt(payee_names: list[str], accounts: list[Account]) -> str:
+    """Build the static part of the classification prompt: payees, accounts, rules.
+
+    classify_email() sends this as a `system` block marked for prompt caching
+    and puts only the email in the user turn. Every call in a run then shares
+    this prefix, so after the first call the API reads it from cache instead
+    of reprocessing ~22k tokens at full price.
+
+    Keep this a pure function of its arguments. Anything that varies per email
+    or per call (the email, today's date, a timestamp) changes the prefix and
+    silently turns caching off; put such values in the user turn instead.
+    """
+    # Format payee list for the prompt
+    # Limit to MAX_PROMPT_PAYEES (see the note there on what gets dropped). Sorting
+    # also keeps the text identical from call to call, which caching depends on.
+    sorted_payees = sorted(payee_names)
+    payee_list = "\n".join(sorted_payees[:MAX_PROMPT_PAYEES])
+
+    # Format account list for the prompt
+    accounts_text = _render_account_list(accounts)
+
+    # Structured prompt asking for JSON output with explicit checklist
+    return f"""Analyze the email in the user message and determine if it's related to a financial transaction.
+
+---
+
+EXISTING PAYEES (for matching):
+{payee_list}
+
+---
+
+ACCOUNTS (for routing):
+{accounts_text}
+
+---
+
+## CLASSIFICATION CHECKLIST
+
+Answer YES or NO for each criterion:
+
+**Positive signals (reasons TO import):**
+1. `specific_amount` - Contains a specific dollar amount
+2. `transaction_date` - Contains a transaction/purchase/payment date
+3. `merchant_identified` - Names a merchant or payee
+4. `payment_method` - References a real payment method (card, bank, PayPal)
+5. `confirmation_language` - Uses confirmation language ("charged", "paid", "refunded")
+6. `account_match` - Mentions one of the user's configured financial accounts
+
+**Negative signals (reasons NOT to import):**
+7. `balance_credit` - Credits to store balance, gift card, rewards points (not real money)
+8. `shipping_only` - Shipping/delivery notification without a charge
+9. `reminder_only` - Reminder, alert, or notice (not a confirmation)
+10. `marketing` - Marketing or promotional content
+11. `approximate_amount` - The stated amount is not the exact final charge (e.g., "$X + taxes", "starting at $X", "estimated $X")
+
+## SCORING FORMULA
+
+Calculate the score using these weights:
+
+**Positive signal weights:**
+- `specific_amount`: +3 (core requirement)
+- `confirmation_language`: +3 (distinguishes receipts from notices)
+- `transaction_date`: +2 (strong transaction indicator)
+- `payment_method`: +2 (confirms payment occurred)
+- `merchant_identified`: +1 (helpful but common)
+- `account_match`: +1 (bonus for account routing)
+
+**Negative signal weights:**
+- `marketing`: -5 (never import marketing)
+- `balance_credit`: -4 (not real money movement)
+- `shipping_only`: -2 (has financial data, but not a charge)
+- `reminder_only`: -2 (may have amount, but no transaction yet)
+- `approximate_amount`: -5 (amount would be wrong, real receipt comes later)
+
+**Calculation:**
+1. Start with base score of 3
+2. Add weights for TRUE positive signals
+3. Subtract weights for TRUE negative signals
+4. Clamp result to range 1-10
+
+## DIRECTION
+
+- OUTFLOW: Money I spent (purchases, subscriptions, bills, fees, charges)
+- INFLOW: Money returned to my actual payment method (refunds to credit card, refunds to bank account, cashback deposits). NOT store credit, account balances, or gift card balances.
+
+## CURRENCY
+
+Identify every currency that appears in the email — symbols (`$`, `£`, `€`, `¥`) and codes (`USD`, `GBP`, `EUR`, `JPY`, etc.). Note: a bare `$` is ambiguous (could be USD, CAD, AUD, MXN); treat it as USD unless the email context clearly indicates otherwise (e.g., "CAD $", "AU$").
+
+Then extract the amount using these rules:
+
+- If the email shows USD alongside one or more other currencies, extract the **USD** amount and set `currency: "USD"`.
+- If the email shows **only** non-USD currency (e.g., only GBP, only EUR), extract that amount and set `currency` to the actual 3-letter ISO code (e.g. `"GBP"`, `"EUR"`). Do NOT default to USD.
+- If no currency is identifiable in the email, set `currency: null`.
+
+The `amount` you return must be denominated in the currency you report. Do not convert between currencies.
+
+Respond with JSON in this format (values are illustrative):
+{{
+  "checklist": {{
+    "specific_amount": true,
+    "transaction_date": true,
+    "merchant_identified": true,
+    "payment_method": true,
+    "confirmation_language": true,
+    "account_match": false,
+    "balance_credit": false,
+    "shipping_only": false,
+    "reminder_only": false,
+    "marketing": false,
+    "approximate_amount": false
+  }},
+  "score": 8,
+  "direction": "outflow",
+  "merchant": "Store Name or Source",
+  "matched_payee": "Existing Payee Name",
+  "account_name": "Account Name",
+  "amount": 29.99,
+  "currency": "USD",
+  "date": "2024-01-15",
+  "date_confidence": "certain",
+  "description": "Brief description of transaction",
+  "reasoning": "Why you gave this score based on the checklist"
+}}
+
+Rules:
+- "score" must be an integer from 1-10, calculated using the formula above
+- "direction" must be either "inflow" or "outflow"
+- "amount" must be the TOTAL amount charged to the payment method — including tax, tips, fees, and surcharges. If the email shows both a subtotal and a total, always use the total. Must be a positive number (no currency symbols), or null if not found. See the CURRENCY section above for which amount to pick when multiple currencies are present.
+- "currency" must be the 3-letter ISO code of the currency in which `amount` is denominated (e.g. "USD", "GBP", "EUR"). Set to null only if no currency is identifiable in the email. Do not default to "USD" when the email clearly shows a different currency.
+- "date" must be YYYY-MM-DD format. For purchase receipts, use the purchase date. For bills with autopay, use the due date (when payment will be charged). For payment confirmations, use the payment date. Use null if not found.
+- "date_confidence" indicates how certain you are about the date:
+  - "certain": The email explicitly states this exact date (e.g., "Due Date: Feb 19, 2026" or "Payment scheduled for 2/19/26")
+  - "likely": The date is implied but not explicitly stated
+  - null: Date was inferred or uncertain
+  Future dates require "certain" confidence to be used; otherwise they'll be adjusted to today.
+- "merchant" should be the business/source name as it appears in the email, or null if not found
+- "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "Co.", etc. Only use a value from the provided list.
+- "account_name" should be the EXACT name from the ACCOUNTS list that this transaction belongs to based on the account descriptions. Use null to route to the default account. Only use a value from the provided list.
+- Account descriptions may list "last 4" digits for an account number and/or a debit/credit card. If the email references an account or card ending in any of an account's listed last-4 values, that is a definitive routing match — use that account. Do not invent a digit-to-account mapping that is not explicitly stated; if the email's digits match no listed value, ignore them and route using the rest of the descriptions.
+- "description" should briefly describe the transaction"""
 
 
 # =============================================================================
@@ -1756,6 +1910,11 @@ def classify_email(
         6-7: Probably a transaction, may be missing details
         8-10: Clearly a transaction with amount and merchant
 
+    The static part of the prompt (see _classification_system_prompt) goes in
+    a system block marked `cache_control: ephemeral`, and only the email goes
+    in the user turn. The first call in a run writes the cache; later calls
+    read it, which the "Token usage" debug line shows.
+
     Args:
         email: The email to classify.
         client: Initialized Anthropic client.
@@ -1769,151 +1928,33 @@ def classify_email(
     # Truncate body to avoid token limits (8000 chars ≈ 2000 tokens)
     truncated_body = email.body[:8000]
 
-    # Format payee list for the prompt
-    # Limit to 2000 payees to stay within reasonable token limits
-    sorted_payees = sorted(payee_names)
-    payee_list = "\n".join(sorted_payees[:2000])
-
-    # Format account list for the prompt
-    accounts_text = _render_account_list(accounts)
-
-    # Structured prompt asking for JSON output with explicit checklist
-    prompt = f"""Analyze this email and determine if it's related to a financial transaction.
-
-FROM: {email.from_email}
+    # Payees, accounts, and rules are the same for every email in a run, so they
+    # go in a cached system block; only the email itself goes in the user turn.
+    system_prompt = _classification_system_prompt(payee_names, accounts)
+    email_text = f"""FROM: {email.from_email}
 SUBJECT: {email.subject}
 
 BODY:
-{truncated_body}
-
----
-
-EXISTING PAYEES (for matching):
-{payee_list}
-
----
-
-ACCOUNTS (for routing):
-{accounts_text}
-
----
-
-## CLASSIFICATION CHECKLIST
-
-Answer YES or NO for each criterion:
-
-**Positive signals (reasons TO import):**
-1. `specific_amount` - Contains a specific dollar amount
-2. `transaction_date` - Contains a transaction/purchase/payment date
-3. `merchant_identified` - Names a merchant or payee
-4. `payment_method` - References a real payment method (card, bank, PayPal)
-5. `confirmation_language` - Uses confirmation language ("charged", "paid", "refunded")
-6. `account_match` - Mentions one of the user's configured financial accounts
-
-**Negative signals (reasons NOT to import):**
-7. `balance_credit` - Credits to store balance, gift card, rewards points (not real money)
-8. `shipping_only` - Shipping/delivery notification without a charge
-9. `reminder_only` - Reminder, alert, or notice (not a confirmation)
-10. `marketing` - Marketing or promotional content
-11. `approximate_amount` - The stated amount is not the exact final charge (e.g., "$X + taxes", "starting at $X", "estimated $X")
-
-## SCORING FORMULA
-
-Calculate the score using these weights:
-
-**Positive signal weights:**
-- `specific_amount`: +3 (core requirement)
-- `confirmation_language`: +3 (distinguishes receipts from notices)
-- `transaction_date`: +2 (strong transaction indicator)
-- `payment_method`: +2 (confirms payment occurred)
-- `merchant_identified`: +1 (helpful but common)
-- `account_match`: +1 (bonus for account routing)
-
-**Negative signal weights:**
-- `marketing`: -5 (never import marketing)
-- `balance_credit`: -4 (not real money movement)
-- `shipping_only`: -2 (has financial data, but not a charge)
-- `reminder_only`: -2 (may have amount, but no transaction yet)
-- `approximate_amount`: -5 (amount would be wrong, real receipt comes later)
-
-**Calculation:**
-1. Start with base score of 3
-2. Add weights for TRUE positive signals
-3. Subtract weights for TRUE negative signals
-4. Clamp result to range 1-10
-
-## DIRECTION
-
-- OUTFLOW: Money I spent (purchases, subscriptions, bills, fees, charges)
-- INFLOW: Money returned to my actual payment method (refunds to credit card, refunds to bank account, cashback deposits). NOT store credit, account balances, or gift card balances.
-
-## CURRENCY
-
-Identify every currency that appears in the email — symbols (`$`, `£`, `€`, `¥`) and codes (`USD`, `GBP`, `EUR`, `JPY`, etc.). Note: a bare `$` is ambiguous (could be USD, CAD, AUD, MXN); treat it as USD unless the email context clearly indicates otherwise (e.g., "CAD $", "AU$").
-
-Then extract the amount using these rules:
-
-- If the email shows USD alongside one or more other currencies, extract the **USD** amount and set `currency: "USD"`.
-- If the email shows **only** non-USD currency (e.g., only GBP, only EUR), extract that amount and set `currency` to the actual 3-letter ISO code (e.g. `"GBP"`, `"EUR"`). Do NOT default to USD.
-- If no currency is identifiable in the email, set `currency: null`.
-
-The `amount` you return must be denominated in the currency you report. Do not convert between currencies.
-
-Respond with JSON in this format (values are illustrative):
-{{
-  "checklist": {{
-    "specific_amount": true,
-    "transaction_date": true,
-    "merchant_identified": true,
-    "payment_method": true,
-    "confirmation_language": true,
-    "account_match": false,
-    "balance_credit": false,
-    "shipping_only": false,
-    "reminder_only": false,
-    "marketing": false,
-    "approximate_amount": false
-  }},
-  "score": 8,
-  "direction": "outflow",
-  "merchant": "Store Name or Source",
-  "matched_payee": "Existing Payee Name",
-  "account_name": "Account Name",
-  "amount": 29.99,
-  "currency": "USD",
-  "date": "2024-01-15",
-  "date_confidence": "certain",
-  "description": "Brief description of transaction",
-  "reasoning": "Why you gave this score based on the checklist"
-}}
-
-Rules:
-- "score" must be an integer from 1-10, calculated using the formula above
-- "direction" must be either "inflow" or "outflow"
-- "amount" must be the TOTAL amount charged to the payment method — including tax, tips, fees, and surcharges. If the email shows both a subtotal and a total, always use the total. Must be a positive number (no currency symbols), or null if not found. See the CURRENCY section above for which amount to pick when multiple currencies are present.
-- "currency" must be the 3-letter ISO code of the currency in which `amount` is denominated (e.g. "USD", "GBP", "EUR"). Set to null only if no currency is identifiable in the email. Do not default to "USD" when the email clearly shows a different currency.
-- "date" must be YYYY-MM-DD format. For purchase receipts, use the purchase date. For bills with autopay, use the due date (when payment will be charged). For payment confirmations, use the payment date. Use null if not found.
-- "date_confidence" indicates how certain you are about the date:
-  - "certain": The email explicitly states this exact date (e.g., "Due Date: Feb 19, 2026" or "Payment scheduled for 2/19/26")
-  - "likely": The date is implied but not explicitly stated
-  - null: Date was inferred or uncertain
-  Future dates require "certain" confidence to be used; otherwise they'll be adjusted to today.
-- "merchant" should be the business/source name as it appears in the email, or null if not found
-- "matched_payee" should be the EXACT name from the EXISTING PAYEES list that best matches this merchant. Use null if no good match exists. Consider abbreviations (e.g., "HOA" = "Homeowners Association"), common variations, and ignore suffixes like "Inc", "LLC", "Co.", etc. Only use a value from the provided list.
-- "account_name" should be the EXACT name from the ACCOUNTS list that this transaction belongs to based on the account descriptions. Use null to route to the default account. Only use a value from the provided list.
-- Account descriptions may list "last 4" digits for an account number and/or a debit/credit card. If the email references an account or card ending in any of an account's listed last-4 values, that is a definitive routing match — use that account. Do not invent a digit-to-account mapping that is not explicitly stated; if the email's digits match no listed value, ignore them and route using the rest of the descriptions.
-- "description" should briefly describe the transaction"""
+{truncated_body}"""
 
     message = client.messages.create(
         model=CLAUDE_MODEL,
         # Thinking counts toward max_tokens even though its text isn't returned.
         max_tokens=16000,
-        messages=[{"role": "user", "content": prompt}],
+        system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": email_text}],
         thinking={"type": "adaptive"},  # explicit; also the model's default
         output_config={
             "effort": "high",
             "format": {"type": "json_schema", "schema": CLASSIFICATION_SCHEMA},
         },
+    )
+    log.debug(
+        "  Token usage: input=%s, cache_write=%s, cache_read=%s, output=%s",
+        message.usage.input_tokens,
+        message.usage.cache_creation_input_tokens,
+        message.usage.cache_read_input_tokens,
+        message.usage.output_tokens,
     )
     return _classification_from_message(message, email.subject)
 
@@ -3027,6 +3068,14 @@ def _process_emails_impl(force: bool):
         CONFIG["ynab_budget_id"],
     )
     log.info("Using %d cached YNAB payees for matching", len(payee_names))
+    if len(payee_names) > MAX_PROMPT_PAYEES:
+        log.warning(
+            "%d YNAB payees exceeds MAX_PROMPT_PAYEES (%d); %d payees at the end of the sort "
+            "can't be matched and will import as new payees",
+            len(payee_names),
+            MAX_PROMPT_PAYEES,
+            len(payee_names) - MAX_PROMPT_PAYEES,
+        )
 
     # Warn about payees with leading/trailing whitespace in YNAB
     with sqlite3.connect(DB_PATH) as conn:

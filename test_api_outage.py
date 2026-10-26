@@ -34,7 +34,7 @@ import tempfile
 from pathlib import Path
 
 import anthropic
-from anthropic.types import Message, TextBlock
+from anthropic.types import Message, TextBlock, Usage
 
 import fastmail2ynab as fm
 
@@ -59,6 +59,7 @@ class FakeMessages:
                 content=[TextBlock(type="text", text=MARKETING)],
                 stop_reason="end_turn",
                 stop_details=None,
+                usage=Usage(input_tokens=0, output_tokens=0),
             )
         if self.calls == 2:
             # The request is only stored on the exception, and the SDK's HTTP library has changed names.
