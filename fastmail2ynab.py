@@ -3,7 +3,6 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "requests>=2.31.0",
-#     "python-dotenv>=1.0.0",
 #     "anthropic>=0.119.0",
 #     "questionary>=2.0.0",
 #     "html2text>=2024.2.26",
@@ -29,7 +28,7 @@ The workflow:
     - If score meets threshold, extract merchant/amount/date
     - Create an unapproved transaction in YNAB (or scheduled transaction for
       future-dated bills with high confidence)
-    - Skip receipts paid with an untracked card (a YNAB_ACCOUNTS entry marked
+    - Skip receipts paid with an untracked card (a config.json account marked
       "skip": true): record them as processed but leave them in the inbox
     - Archive the source emails in Fastmail after successful YNAB upload
     - Track processed emails in SQLite to avoid duplicates
@@ -42,19 +41,19 @@ Usage:
     # Force reimport (reprocess all emails, bypass YNAB duplicate detection)
     uv run fastmail2ynab.py --force
 
-Environment Variables (in .env file):
+Secrets (macOS login Keychain, service com.aheckler.fastmail2ynab, account = name):
     FASTMAIL_TOKEN         - Fastmail API token with mail read/write access
     ANTHROPIC_API_KEY      - Claude API key
     YNAB_TOKEN             - YNAB personal access token
-    YNAB_BUDGET_ID         - Target budget UUID
-    YNAB_ACCOUNTS          - JSON array of account configurations (see .env.example).
+
+    A variable already set in the environment wins over the Keychain.
+
+Settings (config.json, gitignored; see config.example.json):
+    ynab_budget_id         - Target budget UUID
+    accounts               - Array of account configurations.
                              Entries marked "skip": true are untracked cards;
                              receipts routed to them are skipped, not imported.
-    MIN_SCORE              - Minimum AI confidence to import (default: 6)
-
-    If .env is a 1Password Environments pipe rather than a regular file, the
-    1Password desktop app must be running and unlocked. The script checks this
-    and exits with an explanation instead of blocking on the pipe.
+    min_score              - Minimum AI confidence to import, 1-10 (default: 6)
 
 Account Descriptions (in .env.notes file):
     Detailed descriptions for each account to help AI route transactions.
@@ -69,7 +68,6 @@ Account Descriptions (in .env.notes file):
 import argparse
 import contextlib
 import hashlib
-import io
 import json
 import logging
 import os
@@ -77,7 +75,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
 import traceback
 import uuid
@@ -91,146 +88,121 @@ import html2text
 import questionary
 import requests
 from claude_preflight import api_error_kind, check
-from dotenv import load_dotenv
 
 # =============================================================================
 # Configuration & Constants
 # =============================================================================
 
 
-def safe_int(value: str | None, default: int) -> int:
-    """Safely convert string to int with fallback.
+# Secrets live in the macOS login Keychain, one generic password per variable:
+# service KEYCHAIN_SERVICE, with the variable name as the account. Store or rotate one with
+#   security add-generic-password -U -s com.aheckler.fastmail2ynab -a YNAB_TOKEN -j "<what; where to get a new one>" -w
+KEYCHAIN_SERVICE = "com.aheckler.fastmail2ynab"
+SECRET_NAMES = ("FASTMAIL_TOKEN", "ANTHROPIC_API_KEY", "YNAB_TOKEN")
+
+# Non-secret settings: budget, accounts, score threshold. Gitignored; see config.example.json.
+CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_KEYS = {"ynab_budget_id": str, "min_score": int, "accounts": list}
+# compute_score() clamps every score to 1-10, so a threshold outside that range
+# would import everything (below 1) or nothing (above 10).
+MIN_SCORE_RANGE = (1, 10)
+
+
+def load_secrets(names: tuple[str, ...] = SECRET_NAMES) -> None:
+    """Export Keychain secrets into os.environ, for names not already set.
+
+    The login keychain is unlocked whenever the Mac is, and `security` reads
+    entries it created without a prompt, so this never blocks or asks for
+    Touch ID. A variable already set in the environment, even to an empty
+    string, wins, so `YNAB_TOKEN=... uv run fastmail2ynab.py` still works as a
+    one-off override. A missing entry leaves the variable unset, and the
+    "Missing configuration" check at startup reports it. Off macOS (no
+    `security`), environment variables are the only source.
+
+    Values must be printable ASCII: `security -w` prints anything else as hex.
 
     Args:
-        value: String to convert, or None.
-        default: Value to return if conversion fails.
-
-    Returns:
-        The integer value, or default if value is None or not a valid integer.
+        names: Variables to load. Defaults to SECRET_NAMES.
     """
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-# Seconds to wait for 1Password to write the FIFO-backed .env before giving up.
-ENV_FIFO_TIMEOUT_SECONDS = 30
-
-
-def _one_password_running() -> bool:
-    """Check whether the 1Password desktop app is running.
-
-    Both the main app and its helper process exec as `1Password`, so a match on
-    either is a valid "1Password is up" signal.
-
-    Returns:
-        True if at least one 1Password process is running.
-    """
-    try:
-        result = subprocess.run(
-            ["/usr/bin/pgrep", "-x", "1Password"],
-            capture_output=True,
-            check=False,
-        )
-    except OSError:
-        # pgrep missing or unrunnable - don't block the run over a failed check.
-        return True
-    return result.returncode == 0
-
-
-def _read_fifo_with_timeout(path: Path, timeout: float) -> str | None:
-    """Read a FIFO without hanging forever when no writer attaches.
-
-    Opening a FIFO for reading blocks until some process opens it for writing.
-    The read happens on a daemon thread so a blocked open can be abandoned; the
-    thread dies with the process.
-
-    Args:
-        path: Path to the FIFO.
-        timeout: Seconds to wait before giving up.
-
-    Returns:
-        The FIFO's contents, or None if the read did not finish in time.
-
-    Raises:
-        OSError: If the read itself failed (permissions, vanished path, etc).
-    """
-    content: list[str] = []
-    error: list[BaseException] = []
-
-    def _read() -> None:
+    for name in names:
+        if name in os.environ:
+            continue
         try:
-            with path.open(encoding="utf-8") as stream:
-                content.append(stream.read())
-        except BaseException as exc:
-            # Stashed, then re-raised on the main thread where it can be handled.
-            error.append(exc)
+            # Fixed absolute binary; the only variable is one of our own SECRET_NAMES.
+            result = subprocess.run(  # noqa: S603
+                [
+                    "/usr/bin/security",
+                    "find-generic-password",
+                    "-s",
+                    KEYCHAIN_SERVICE,
+                    "-a",
+                    name,
+                    "-w",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return
+        if result.returncode == 0:
+            os.environ[name] = result.stdout.removesuffix("\n")
 
-    reader = threading.Thread(target=_read, daemon=True)
-    reader.start()
-    reader.join(timeout)
 
-    if error:
-        raise error[0]
-    if reader.is_alive():
-        return None
-    return content[0] if content else ""
+def load_local_config(path: Path | None = None) -> dict:
+    """Read the non-secret settings from config.json.
 
-
-def load_env_or_exit(env_path: Path | None = None) -> None:
-    """Load .env, failing fast instead of hanging on a 1Password FIFO.
-
-    Adam's .env is a named pipe mounted by 1Password Environments, not a regular
-    file. If 1Password isn't running, nothing ever opens the pipe for writing and
-    the read blocks forever with no output and no log. This turns each of those
-    stalls into an immediate, actionable error.
-
-    A regular .env file takes the ordinary python-dotenv path, unchanged.
+    A missing file returns {} so that importing this module, as every test
+    does, never fails; the startup checks then report what is missing. A file
+    that exists but is malformed exits with a message instead of guessing.
 
     Args:
-        env_path: Path to the .env file. Defaults to the one beside this script;
-            the parameter exists so tests can point at a scratch FIFO.
+        path: Path to the file. Defaults to CONFIG_PATH; tests pass a scratch file.
+
+    Returns:
+        The parsed settings, each optional: "ynab_budget_id" (str),
+        "min_score" (int), and "accounts" (list).
 
     Raises:
-        SystemExit: If the pipe can't be read or carries no variables.
+        SystemExit: If the file isn't a JSON object, has an unknown key, a
+            value has the wrong type (null included), or min_score is outside 1-10.
     """
-    if env_path is None:
-        env_path = Path(__file__).parent / ".env"
-
-    if not env_path.is_fifo():
-        load_dotenv(env_path)
-        return
-
-    if not _one_password_running():
+    if path is None:
+        path = CONFIG_PATH
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Error: {path.name} is not valid JSON: {e}") from None
+    if not isinstance(data, dict):
+        raise SystemExit(f"Error: {path.name} must contain a JSON object") from None
+    unknown = sorted(set(data) - set(CONFIG_KEYS))
+    if unknown:
+        raise SystemExit(f"Error: unknown key(s) in {path.name}: {', '.join(unknown)}") from None
+    for key, kind in CONFIG_KEYS.items():
+        if key not in data:
+            continue
+        value = data[key]
+        # A present key must hold a real value: null is a wrong type, not "use the
+        # default". bool is a subclass of int, so rule it out explicitly.
+        if isinstance(value, bool) or not isinstance(value, kind):
+            raise SystemExit(
+                f"Error: '{key}' in {path.name} has the wrong type (expected {kind.__name__})"
+            ) from None
+    min_score = data.get("min_score")
+    if min_score is not None and not MIN_SCORE_RANGE[0] <= min_score <= MIN_SCORE_RANGE[1]:
         raise SystemExit(
-            "Error: .env is a 1Password Environments pipe, but 1Password isn't running.\n"
-            "Launch 1Password, then retry."
-        )
-
-    # Read once. The pipe is one-shot per open - a second read returns only the
-    # comment header - so parse from the text we already have.
-    text = _read_fifo_with_timeout(env_path, ENV_FIFO_TIMEOUT_SECONDS)
-    if text is None:
-        raise SystemExit(
-            f"Error: Timed out after {ENV_FIFO_TIMEOUT_SECONDS}s waiting for "
-            "1Password to write .env.\n"
-            "Check that the vault is unlocked and the Environments destination\n"
-            "for fastmail2ynab is enabled."
-        )
-
-    if not load_dotenv(stream=io.StringIO(text)):
-        raise SystemExit(
-            "Error: 1Password wrote .env but it contains no variables.\n"
-            "Check that the Environments destination for fastmail2ynab is enabled\n"
-            "and that its item still has the expected fields."
-        )
+            f"Error: 'min_score' in {path.name} must be between {MIN_SCORE_RANGE[0]} and "
+            f"{MIN_SCORE_RANGE[1]} (got {min_score})"
+        ) from None
+    return data
 
 
-# Load environment variables from .env file
-load_env_or_exit()
+load_secrets()
+LOCAL_CONFIG = load_local_config()
 
 
 def parse_env_notes(script_dir: Path) -> dict[str, str]:
@@ -280,7 +252,7 @@ def parse_env_notes(script_dir: Path) -> dict[str, str]:
 
 
 def load_accounts(script_dir: Path) -> list["Account"]:
-    """Load YNAB accounts from YNAB_ACCOUNTS env var and merge with .env.notes.
+    """Load YNAB accounts from the "accounts" list in config.json and merge with .env.notes.
 
     Args:
         script_dir: Directory containing .env.notes file.
@@ -296,17 +268,10 @@ def load_accounts(script_dir: Path) -> list["Account"]:
 
     del dataclass_fields  # Only imported to ensure Account is defined
 
-    accounts_json = os.getenv("YNAB_ACCOUNTS")
-    if not accounts_json:
+    # load_local_config() has already checked that "accounts" is a list.
+    accounts_data = LOCAL_CONFIG.get("accounts")
+    if not accounts_data:
         return []
-
-    try:
-        accounts_data = json.loads(accounts_json)
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"Error: YNAB_ACCOUNTS is not valid JSON: {e}") from None
-
-    if not isinstance(accounts_data, list):
-        raise SystemExit("Error: YNAB_ACCOUNTS must be a JSON array") from None
 
     # Parse .env.notes for account descriptions
     env_notes = parse_env_notes(script_dir)
@@ -316,18 +281,18 @@ def load_accounts(script_dir: Path) -> list["Account"]:
 
     for i, acct in enumerate(accounts_data):
         if not isinstance(acct, dict):
-            raise SystemExit(f"Error: YNAB_ACCOUNTS[{i}] must be an object") from None
+            raise SystemExit(f"Error: accounts[{i}] in config.json must be an object") from None
 
         name = acct.get("name")
         ynab_id = acct.get("ynab_id")
         skip = bool(acct.get("skip", False))
 
         if not name:
-            raise SystemExit(f"Error: YNAB_ACCOUNTS[{i}] missing 'name'") from None
+            raise SystemExit(f"Error: accounts[{i}] in config.json missing 'name'") from None
         # Skip accounts (untracked cards) never create transactions, so they
         # do not need a ynab_id. Every other account still requires one.
         if not skip and not ynab_id:
-            raise SystemExit(f"Error: YNAB_ACCOUNTS[{i}] missing 'ynab_id'") from None
+            raise SystemExit(f"Error: accounts[{i}] in config.json missing 'ynab_id'") from None
 
         if name in seen_names:
             raise SystemExit(f"Error: Duplicate account name '{name}'") from None
@@ -349,7 +314,7 @@ def load_accounts(script_dir: Path) -> list["Account"]:
     # Validate exactly one default account
     default_accounts = [a for a in accounts if a.default]
     if len(default_accounts) == 0:
-        raise SystemExit("Error: No account marked as default in YNAB_ACCOUNTS") from None
+        raise SystemExit("Error: No account marked as default in config.json accounts") from None
     if len(default_accounts) > 1:
         names = ", ".join(a.name for a in default_accounts)
         raise SystemExit(f"Error: Multiple default accounts: {names}") from None
@@ -395,16 +360,17 @@ MAX_PROMPT_PAYEES = 3000
 # Script directory for config files
 SCRIPT_DIR = Path(__file__).parent
 
-# Configuration dictionary - all settings loaded from environment
+# Configuration dictionary - secrets from the environment (filled from the
+# Keychain by load_secrets()), settings from config.json (LOCAL_CONFIG)
 CONFIG: dict = {
     # API credentials
     "fastmail_token": os.getenv("FASTMAIL_TOKEN"),  # Fastmail JMAP bearer token
     "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY"),  # Claude API key
     "ynab_token": os.getenv("YNAB_TOKEN"),  # YNAB personal access token
     # YNAB target location
-    "ynab_budget_id": os.getenv("YNAB_BUDGET_ID"),  # Budget to add transactions to
+    "ynab_budget_id": LOCAL_CONFIG.get("ynab_budget_id"),  # Budget to add transactions to
     # Processing settings
-    "min_score": safe_int(os.getenv("MIN_SCORE"), 6),  # Min AI score (1-10) to import
+    "min_score": LOCAL_CONFIG.get("min_score", 6),  # Min AI score (1-10) to import
 }
 
 # Load multi-account configuration
@@ -3007,16 +2973,19 @@ def process_emails(force: bool = False):
     missing = [k for k, v in CONFIG.items() if not v]
     if missing:
         print(f"Error: Missing configuration: {', '.join(missing)}")
-        print("Copy .env.example to .env and fill in your credentials.")
+        print(
+            "Secrets (fastmail_token, anthropic_api_key, ynab_token) go in the macOS Keychain:\n"
+            f"  security add-generic-password -U -s {KEYCHAIN_SERVICE} -a <FASTMAIL_TOKEN|ANTHROPIC_API_KEY|YNAB_TOKEN> "
+            '-j "<what; where to get a new one>" -w\n'
+            "Settings (ynab_budget_id) go in config.json: copy config.example.json and edit it."
+        )
         return
 
     # Load and validate multi-account configuration
     _init_accounts()
     if not ACCOUNTS:
-        print("Error: No accounts configured. Set YNAB_ACCOUNTS in .env")
-        print(
-            'Example: YNAB_ACCOUNTS=\'[{"name": "My Card", "ynab_id": "abc-123", "default": true}]\''
-        )
+        print('Error: No accounts configured. Add an "accounts" list to config.json')
+        print('Example: "accounts": [{"name": "My Card", "ynab_id": "abc-123", "default": true}]')
         return
 
     _process_emails_impl(force=force)
@@ -3535,7 +3504,7 @@ def _process_emails_impl(force: bool):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Import receipt emails from Fastmail to YNAB",
-        epilog="Environment variables should be set in a .env file. See CLAUDE.md for details.",
+        epilog="Secrets come from the macOS Keychain; settings from config.json. See CLAUDE.md for details.",
     )
     parser.add_argument(
         "--force",

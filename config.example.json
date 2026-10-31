@@ -1,0 +1,11 @@
+{
+  "ynab_budget_id": "your-ynab-budget-id",
+  "min_score": 6,
+  "accounts": [
+    {"name": "Example Card", "ynab_id": "abc-123-your-account-id", "default": true},
+    {"name": "Another Card", "ynab_id": "def-456-your-account-id"},
+    {"name": "Bank Checking", "ynab_id": "ghi-789-your-account-id"},
+    {"name": "Bank Savings", "ynab_id": "jkl-123-your-account-id"},
+    {"name": "Company Card", "skip": true}
+  ]
+}

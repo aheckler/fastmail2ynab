@@ -1,6 +1,7 @@
-# Environment variables (contains API keys and account info)
+# Local settings and account info (secrets live in the macOS Keychain)
 .env
 .env.notes
+config.json
 
 # Local database (contains user data)
 processed_emails.db

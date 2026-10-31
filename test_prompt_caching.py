@@ -3,7 +3,6 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "requests>=2.31.0",
-#     "python-dotenv>=1.0.0",
 #     "anthropic>=0.119.0",
 #     "questionary>=2.0.0",
 #     "html2text>=2024.2.26",

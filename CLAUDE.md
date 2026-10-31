@@ -50,13 +50,13 @@ Six test files run standalone, no pytest needed. Each has its own PEP 723 header
 ```bash
 uv run test_compute_score.py     # score is a pure function of the checklist
 uv run test_batch_mapping.py     # batch results matched by import_id, not position
-uv run test_env_loader.py        # .env loader never hangs on the 1Password pipe
+uv run test_secrets_loader.py    # Keychain loader + config.json reader contract
 uv run test_response_parsing.py  # text read by block type; refusal/max_tokens/parse-failure handling
 uv run test_api_outage.py        # an outage mid-run stops Claude calls and leaves the rest for next run
 uv run test_prompt_caching.py    # static prompt is one cached system block, identical for every email
 ```
 
-Each test file imports `fastmail2ynab`, which runs `load_env_or_exit()` at import. So running any test reads the real 1Password pipe and may prompt for Touch ID. The tests themselves use scratch FIFOs and never touch the real `.env`.
+Each test file imports `fastmail2ynab`, which runs `load_secrets()` and `load_local_config()` at import. So every test process silently reads the real Keychain entries and the real `config.json` (a missing `config.json` is fine: it loads as `{}`). `test_secrets_loader.py` itself stubs `subprocess.run` and uses scratch config files, so it never depends on the real ones.
 
 ## Architecture
 
@@ -66,7 +66,7 @@ The entire application is in a single file (`fastmail2ynab.py`) with these main 
 2. **Claude classification**: Uses Claude API to score emails 1-10 and extract transaction data (merchant, amount, currency, date, date_confidence, inflow/outflow, account). When an email shows multiple currencies, Claude picks the USD amount; when only non-USD currencies appear, the email is skipped (no conversion performed). The model is `CLAUDE_MODEL` (Claude Sonnet 5.5). The request uses structured outputs (`output_config.format` with `CLASSIFICATION_SCHEMA`, whose checklist keys are built from `CHECKLIST_WEIGHTS`), so a successful response is schema-valid JSON with nothing to extract; there is no regex fallback. The prompt is split for prompt caching: `_classification_system_prompt()` builds the static part (payee list, account list, rules; about 22k tokens) and `classify_email()` sends it as one `system` block with `cache_control: {"type": "ephemeral"}`, with only the email (from, subject, body) in the user turn. The first call in a run writes the cache and later calls read it at a fraction of the input price; each call logs a `Token usage` DEBUG line with `cache_write` and `cache_read`. Keep `_classification_system_prompt()` a pure function of the payees and accounts: anything per-email or time-dependent in it changes the prefix and silently turns caching off. `test_prompt_caching.py` pins this. It sets `thinking: {"type": "adaptive"}` explicitly (also the model's default) and `effort: high`, so a response can contain thinking blocks ahead of the JSON. Always pull response text with `_response_text()`, which selects blocks by `.type == "text"` — never index `message.content[0]`, which is a `ThinkingBlock` whenever Claude decides to reason about an email. `max_tokens` (16000) caps thinking and response text combined. `_classification_from_message()` checks `stop_reason` before reading content (see "Classification Checklist" below for how each outcome is handled).
 3. **YNAB API integration**: Creates unapproved transactions in YNAB (batched in groups of 5), fetches payees for name matching. Uses scheduled transactions API for future-dated bills with high confidence. After all creates, runs a settle-then-enforce category phase (see "Category enforcement" below). YNAB's batch-create response returns transactions sorted by date, not in submission order, so created IDs are matched back to their `PendingTransaction` by `import_id` (`_map_batch_create_results`) — never by list position. YNAB rejects a whole batch with a 400 when any one transaction is invalid, so `_create_regular_batch()` retries a 400'd batch one transaction at a time; only the bad one counts as an error and stays unprocessed.
 4. **Payee name matching**: Claude matches merchant names to existing YNAB payees, handling abbreviations and variations. Only the first `MAX_PROMPT_PAYEES` (3000) payees in sorted order go into the prompt. Past that, the payees at the end of the sort can't be matched, so their receipts import under Claude's raw merchant name and create duplicate payees; the run logs a WARNING when this happens. The cap was 2000 until Oct 2026 (at ~1,940 payees). The better long-term fix is to send only recently used payees rather than cutting alphabetically. YNAB's internal payees (`YNAB_INTERNAL_PAYEE_PREFIXES`: `Transfer : `, `Starting Balance`, the balance-adjustment payees) are never offered: `get_cached_payees()` drops them, because YNAB rejects them as a `payee_name` (a transfer can only be created by `payee_id`). As a backstop, a reserved payee that still reaches the transaction-building step (e.g. from an older cached classification) is replaced with Claude's raw merchant name. The script never creates real YNAB transfers: each transfer arrives as one email per side, and each email would create its own full transfer
-5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes`. Accounts marked `"skip": true` are untracked cards (e.g. company cards); receipts routed to them are recorded as processed but never imported.
+5. **Multi-account routing**: Claude determines which YNAB account each transaction belongs to based on account descriptions in `.env.notes` (accounts themselves are listed in `config.json`). Accounts marked `"skip": true` are untracked cards (e.g. company cards); receipts routed to them are recorded as processed but never imported.
 6. **Scheduled transactions**: Future dates (like autopay due dates) with "certain" confidence use YNAB's scheduled transactions API; others are capped to today
 7. **SQLite database**: Five tables - `processed_emails` (tracking), `classification_cache` (Claude results), `ynab_payees` (cached payee list), `ynab_sync_state` (delta sync metadata + one-shot migration markers), `runs` (script execution history). At the start of each `_process_emails_impl` call (every real run, not on `--help` or import), two one-time backfills run in sequence, each gated by its own marker in `ynab_sync_state` and wrapped in `try/except sqlite3.Error` so a transient SQLite failure doesn't abort the whole run: (1) `cache_backfill_checklist_v1` deletes `classification_cache` rows pre-dating the `checklist_json` column; (2) `cache_backfill_checklist_v2` recomputes the `score` column in place for rows with a valid checklist, deleting rows whose checklist is unusable. Future migrations follow the same pattern — new function, new marker key, appended to the wrapped call sequence.
 8. **File-based logging**: Each run writes a detailed log to `logs/YYYY-MM-DD_HH-MM-SS.log` (DEBUG level). Console output is quieter (INFO level, milestones and accepted transactions only). Logs auto-prune after 90 days.
@@ -138,28 +138,32 @@ An API exception from `classify_email()` is never cached or marked processed. If
 
 ## Configuration
 
-### Environment variables in `.env`:
-- `FASTMAIL_TOKEN`, `ANTHROPIC_API_KEY`, `YNAB_TOKEN` - API credentials
-- `YNAB_BUDGET_ID` - Target YNAB budget
-- `YNAB_ACCOUNTS` - JSON array of account configurations (see below)
-- `MIN_SCORE` (default 6) - Minimum AI confidence score to import
+Secrets and settings live in two different places, on purpose.
 
-### `.env` is a 1Password pipe, not a file
+### Secrets: the macOS Keychain
 
-On Adam's machine `.env` is a UNIX named pipe mounted by 1Password Environments, not a regular file. Opening a pipe for reading blocks until a writer attaches, and 1Password is that writer. With 1Password closed, `open()` waits forever: the script hangs at import with no output and no log file, because `load_env_or_exit()` runs long before `setup_logging()`.
+`FASTMAIL_TOKEN`, `ANTHROPIC_API_KEY` and `YNAB_TOKEN` are generic passwords in the login Keychain under the service `com.aheckler.fastmail2ynab`, with the variable name as the account. Each entry carries a `-j` comment saying what it is and where to get a new one. This follows Adam's naming convention for hand-made Keychain entries.
 
-`load_env_or_exit()` replaces the bare `load_dotenv()` call and guards each stall:
+`load_secrets()` runs at import. For each name in `SECRET_NAMES` it runs `/usr/bin/security find-generic-password -s ... -a NAME -w` and exports the value into `os.environ`. That read is silent: no Touch ID, no 1Password, nothing that can block. The rules:
 
-1. A regular `.env` file takes the ordinary `python-dotenv` path, unchanged.
-2. Pipe present but 1Password not running (`pgrep -x 1Password`) - exit immediately, before touching the pipe.
-3. Pipe present and 1Password running - read on a daemon thread with a `ENV_FIFO_TIMEOUT_SECONDS` (30s) deadline. On timeout, exit pointing at a locked vault or disabled destination.
-4. Pipe read but no `KEY=value` lines parsed - exit with its own message.
+- A variable already in the environment, even an empty one, wins and is never looked up. That keeps `YNAB_TOKEN=... uv run fastmail2ynab.py` working as an override, and is the only source off macOS.
+- A missing entry leaves the variable unset. The "Missing configuration" check at the start of `process_emails()` reports it and prints the `security add-generic-password` command.
+- Only the trailing newline is stripped (`removesuffix`, not `strip`), so values come back exactly.
+- Values must be printable ASCII. `security -w` prints anything else as hex, which would silently corrupt the secret.
 
-The pipe is read exactly once and the text handed to `load_dotenv(stream=...)`. It is one-shot per open: a second read returns only the comment header, so never read it twice.
+Until 2026-10-31 these came from a 1Password Environments FIFO mounted at `.env`. That needed 1Password unlocked, a timeout thread, and Touch ID approval, and an unattended read hung or came back empty. Don't bring back `.env` or `python-dotenv`.
 
-`load_env_or_exit()` takes an optional `env_path` purely so `test_env_loader.py` can point it at a scratch FIFO. Leave it `None` in production code.
+### Settings: `config.json`
 
-### `YNAB_ACCOUNTS` format:
+`config.json` sits next to the script and is gitignored, because the repo is public and the budget and account IDs are Adam's. `config.example.json` shows the shape. `load_local_config()` reads it once at import into `LOCAL_CONFIG`:
+
+- `ynab_budget_id` (string): target YNAB budget
+- `min_score` (integer 1-10, default 6): minimum AI confidence score to import
+- `accounts` (list): account configurations, format below
+
+A missing file loads as `{}` so tests can import the module; the startup checks then report what's missing. A file that exists but isn't a JSON object, has an unknown key, or has a value of the wrong type exits with a message. A `bool` doesn't count as an int, and `null` is a wrong type, not a request for the default: leave a key out to get its default. `min_score` must also fall in `MIN_SCORE_RANGE` (1-10). `compute_score()` clamps every score to that range, so a value below 1 would import everything and one above 10 nothing. Because of these checks, `min_score` can never reach the startup "Missing configuration" check. That's stricter than the old `MIN_SCORE` env var, which silently fell back to 6 on a bad value.
+
+### `accounts` format:
 ```json
 [
   {"name": "Chase Freedom", "ynab_id": "abc-123", "default": true},
@@ -188,8 +192,8 @@ Apple Card:
 Goldman Sachs Apple Card. Emails from @apple.com with "Apple Card Transaction".
 ```
 
-The `.env.notes` file provides detailed descriptions to help Claude route transactions to the correct account. Account names must match exactly with names in `YNAB_ACCOUNTS`.
+The `.env.notes` file provides detailed descriptions to help Claude route transactions to the correct account. Account names must match exactly with the names in `config.json`'s `accounts`.
 
 ## Dependencies
 
-Uses `requests` for HTTP, `anthropic` for Claude API, `python-dotenv` for env loading, `html2text` for converting HTML email bodies to plain text, `questionary` for interactive prompts, `claude-preflight` (editable, from `~/Code/claude-preflight`) for the pre-run Claude status gate. Tests are plain scripts with `assert`, run via `uv run` — no test framework.
+Uses `requests` for HTTP, `anthropic` for Claude API, the macOS `security` CLI (no Python package) for secrets, `html2text` for converting HTML email bodies to plain text, `questionary` for interactive prompts, `claude-preflight` (editable, from `~/Code/claude-preflight`) for the pre-run Claude status gate. Tests are plain scripts with `assert`, run via `uv run` — no test framework.

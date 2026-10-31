@@ -23,14 +23,11 @@ brew install uv
 # or: curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### 2. Configure credentials
+### 2. Store your API credentials in the Keychain
 
-```bash
-cp .env.example .env
-cp .env.notes.example .env.notes
-```
-
-Edit `.env` with your credentials:
+The three secrets live in the macOS login Keychain, under the service
+`com.aheckler.fastmail2ynab` with the variable name as the account. The script
+reads them at startup with the `security` CLI: silently, with no Touch ID prompt.
 
 **Fastmail:**
 1. Go to Settings -> Privacy & Security -> Integrations -> API tokens
@@ -39,25 +36,51 @@ Edit `.env` with your credentials:
 **YNAB:**
 1. Go to Account Settings -> Developer Settings
 2. Create a Personal Access Token
-3. Get account IDs from the URL when viewing each account
 
 **Anthropic:**
 1. Go to [console.anthropic.com](https://console.anthropic.com/)
 2. Create an API key
 
-### 3. Configure accounts
+Store each one. Leave `-w` last with no value and `security` prompts for it, so
+the secret never lands in your shell history:
 
-Edit the `YNAB_ACCOUNTS` setting in `.env`:
-
-```json
-[
-  {"name": "Example Card", "ynab_id": "abc-123-your-account-id", "default": true},
-  {"name": "Another Card", "ynab_id": "def-456-your-account-id"},
-  {"name": "Bank Checking", "ynab_id": "ghi-789-your-account-id"},
-  {"name": "Company Card", "skip": true}
-]
+```bash
+S=com.aheckler.fastmail2ynab
+security add-generic-password -U -s $S -a FASTMAIL_TOKEN -j "Fastmail API token (mail read/write)" -w
+security add-generic-password -U -s $S -a YNAB_TOKEN -j "YNAB personal access token" -w
+security add-generic-password -U -s $S -a ANTHROPIC_API_KEY -j "Anthropic API key" -w
 ```
 
+Re-run a command with `-U` to rotate a key. Values must be plain ASCII:
+`security -w` prints anything else as hex. A variable already set in your shell
+wins over the Keychain, so `YNAB_TOKEN=... uv run fastmail2ynab.py` works as a
+one-off override (and is the way to run it off macOS).
+
+### 3. Configure your budget and accounts
+
+```bash
+cp config.example.json config.json
+cp .env.notes.example .env.notes
+```
+
+`config.json` is gitignored. It holds the settings that aren't secrets:
+
+```json
+{
+  "ynab_budget_id": "your-ynab-budget-id",
+  "min_score": 6,
+  "accounts": [
+    {"name": "Example Card", "ynab_id": "abc-123-your-account-id", "default": true},
+    {"name": "Another Card", "ynab_id": "def-456-your-account-id"},
+    {"name": "Bank Checking", "ynab_id": "ghi-789-your-account-id"},
+    {"name": "Company Card", "skip": true}
+  ]
+}
+```
+
+- Get `ynab_budget_id` and each `ynab_id` from the YNAB URL: `app.ynab.com/BUDGET_ID/accounts/ACCOUNT_ID`
+- `min_score` is optional (a whole number from 1 to 10, default 6); see [Configuration](#configuration)
+- An unknown key, a value of the wrong type (including `null`), or a `min_score` outside 1-10 stops the script with an error, so a typo can't silently fall back to a default. To use a default, leave the key out.
 - Each account must have a `name`
 - Each account must have a `ynab_id`, except untracked-card accounts marked `"skip": true` (see [Untracked cards](#untracked-cards-skip-accounts))
 - Exactly one account must have `"default": true`
@@ -108,11 +131,11 @@ uv run fastmail2ynab.py --force
 
 ## Configuration
 
-Edit `.env` to adjust optional settings:
+Edit `config.json` to adjust optional settings:
 
-| Variable | Default | Description |
+| Key | Default | Description |
 |----------|---------|-------------|
-| `MIN_SCORE` | 6 | Minimum AI score (1-10) to import a transaction |
+| `min_score` | 6 | Minimum AI score (1-10) to import a transaction |
 
 ## How scoring works
 
@@ -158,7 +181,7 @@ If Claude can't determine the account, or the suggested account doesn't exist, t
 
 Some receipts that land in your inbox are paid with a card you do not track in YNAB — a company card, a spouse's employer benefits card, and so on. Importing those would create transactions for money that isn't in your budget.
 
-Mark such a card with `"skip": true` in `YNAB_ACCOUNTS`. A skip account needs no `ynab_id`:
+Mark such a card with `"skip": true` in the `accounts` list in `config.json`. A skip account needs no `ynab_id`:
 
 ```json
 {"name": "Company Card", "skip": true}
@@ -232,25 +255,25 @@ YNAB's internal payees (`Transfer : <account>`, `Starting Balance`, and the bala
 
 ## Troubleshooting
 
-**"1Password isn't running" / "Timed out waiting for 1Password to write .env"**
-- Only applies when `.env` is a 1Password Environments pipe instead of a regular file
-- Launch 1Password and unlock the vault, then run again
-- If 1Password is running and unlocked, check that the Environments destination for this project is still enabled
+**"Missing configuration: fastmail_token" (or `anthropic_api_key`, `ynab_token`)**
+- The Keychain entry is missing. Check it with `security find-generic-password -s com.aheckler.fastmail2ynab -a FASTMAIL_TOKEN` (prints the entry's details, not the secret)
+- Add it with the `security add-generic-password` command from Setup step 2
 
-**The script hangs at startup with no output and no log file**
-- Same cause as above, on a version of the script without the guard
-- Opening a named pipe for reading blocks until a writer attaches, and 1Password is the writer
-- No log appears because the `.env` load happens at import, before logging starts
-- Confirm the file type with `ls -l .env` — a leading `p` means it's a pipe
+**"Missing configuration: ynab_budget_id"**
+- `config.json` is missing or has no `ynab_budget_id` (see Setup step 3)
 
-**"Missing configuration"**
-- Ensure `.env` exists and all values are filled in
+**"... is not valid JSON" / "unknown key(s) in config.json" / "has the wrong type"**
+- Fix `config.json`: it must be one JSON object with only `ynab_budget_id` (string), `min_score` (integer), and `accounts` (list)
+- `null` counts as the wrong type. To use a default, leave the key out instead.
+
+**"'min_score' in config.json must be between 1 and 10"**
+- Scores always fall between 1 and 10, so a threshold below 1 would import every email and one above 10 would import nothing. Pick a value from 1 to 10.
 
 **"No accounts configured"**
-- Add `YNAB_ACCOUNTS` to your `.env` file (see Setup section)
+- Add an `accounts` list to `config.json` (see Setup step 3)
 
 **"No account marked as default"**
-- One account in `YNAB_ACCOUNTS` must have `"default": true`
+- One account in the `accounts` list must have `"default": true`
 
 **"Could not find Inbox"**
 - Verify your Fastmail token has mail read permissions
